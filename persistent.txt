@@ -1,0 +1,19 @@
+# Lines starting with "#" are comments
+# 3 connection types: "direct" "altdns" "detour"
+
+# Domain names match itself and all subdomains
+# Example: The following rule matches *.local
+direct local
+direct localhost
+
+# Example: the following rule matches *.google.com
+detour google.com
+detour googleusercontent.com
+detour googleapis.com
+detour googlevideo.com
+
+altdns pixiv.net
+
+# IP addressses can be specified as either single address or network
+direct 192.168.2.0/24
+direct 127.0.0.0/8

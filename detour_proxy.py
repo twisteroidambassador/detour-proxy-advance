@@ -48,7 +48,8 @@ SAVE_DIR = os.path.dirname(__file__)
 PERSISTENT_FILE = os.path.join(SAVE_DIR, 'persistent.txt')
 STATE_FILE = os.path.join(SAVE_DIR, 'state.csv')
 DNS_POISON_FILE = os.path.join(SAVE_DIR, 'dns_poison_list.txt')
-LOG_FILE = os.path.join(SAVE_DIR, 'detour.log')
+#LOG_FILE = os.path.join(SAVE_DIR, 'detour.log')
+LOG_FILE = None
 
 WINDOWS_USE_PROACTOR_EVENT_LOOP = False  # do not use, won't work with aiodns
 IPV6_ONLY = False
@@ -633,18 +634,27 @@ class DetourProxy:
         except aiodns.error.DNSError as e:
             raise UpstreamConnectError(SOCKS5Reply.HOST_UNREACHABLE,
                                        'DNS resolution failed') from e
-        ipv4_addrinfo, ipv6_addrinfo = await asyncio.gather(
-            self._getaddrinfo_altdns_ipv4(host, port),
-            self._getaddrinfo_altdns_ipv6(host, port),
-            loop=self._loop,
-            return_exceptions=True)
+        ipv4_task = asyncio.ensure_future(
+            self._getaddrinfo_altdns_ipv4(host, port), loop=self._loop)
+        ipv6_task = asyncio.ensure_future(
+            self._getaddrinfo_altdns_ipv6(host, port), loop=self._loop)
+        try:
+            await asyncio.wait((ipv4_task, ipv6_task), loop=self._loop)
+        except asyncio.CancelledError:
+            ipv4_task.cancel()
+            ipv6_task.cancel()
+            raise
         exceptions = {}
-        if isinstance(ipv4_addrinfo, BaseException):
-            exceptions['IPv4'] = ipv4_addrinfo
+        try:
+            ipv4_addrinfo = ipv4_task.result()
+        except aiodns.error.DNSError as e:
             ipv4_addrinfo = []
-        if isinstance(ipv6_addrinfo, BaseException):
-            exceptions['IPv6'] = ipv6_addrinfo
+            exceptions['IPv4'] = e
+        try:
+            ipv6_addrinfo = ipv6_task.result()
+        except aiodns.error.DNSError as e:
             ipv6_addrinfo = []
+            exceptions['IPv6'] = e
         if IPV6_FIRST:
             addrinfo = list(roundrobin(ipv6_addrinfo, ipv4_addrinfo))
         else:
@@ -978,8 +988,10 @@ DetourProxy as a SOCKS5 proxy instead.
                 stack.enter_context(finally_close(dwriter))
                 self._logger.debug('%s accepted downstream connection',
                                    log_name)
-
-                initial_byte = await dreader.readexactly(1)
+                try:
+                    initial_byte = await dreader.readexactly(1)
+                except (OSError, asyncio.IncompleteReadError) as e:
+                    raise ServerHandlerError from e
                 if initial_byte == b'\x05':
                     uhost, uport = await self._server_negotiate_socks5(
                         initial_byte, dreader, dwriter)
@@ -1236,7 +1248,7 @@ def sigterm_handler(sig, frame):
 
 def relay():
     rootlogger = logging.getLogger()
-    rootlogger.setLevel(logging.DEBUG)
+    rootlogger.setLevel(logging.INFO)
     stream_formatter = logging.Formatter('%(levelname)-8s %(name)s %(message)s')
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(stream_formatter)

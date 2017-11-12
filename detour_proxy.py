@@ -674,7 +674,7 @@ class DetourProxy:
     async def _getaddrinfo_altdns_ipv6(self, host, port):
         self._logger.debug('Trying to resolve IPv6 addresses of %r',
                            host)
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, '',
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 0, '',
                  (r.host, port))
                 for r in (await self._resolver.query(host, 'AAAA'))]
 

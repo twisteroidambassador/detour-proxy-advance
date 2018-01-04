@@ -32,23 +32,20 @@ from itertools import cycle, islice
 from enum import Enum
 from typing import Dict, Union, Tuple, List
 from functools import partial
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, namedtuple
 
 import aiodns
 
 # ========== Configuration section ==========
 LISTEN_ADDRESS = ('127.0.9.1', 1080)
 ALTERNATE_DNS_SERVERS = ['172.17.251.1']  # no alternate port support
-# ALTERNATE_DNS_SERVERS = ['127.0.9.1']
 UPSTREAM_PROXY_ADDRESS = ('172.17.251.1', 1080)
-# UPSTREAM_PROXY_ADDRESS = ('127.0.0.1', 1080)
-# UPSTREAM_PROXY_ADDRESS = aiosocks.Socks5Addr('127.0.0.1', 1080)
 
 SAVE_DIR = os.path.dirname(__file__)
 PERSISTENT_FILE = os.path.join(SAVE_DIR, 'persistent.txt')
 STATE_FILE = os.path.join(SAVE_DIR, 'state.csv')
 DNS_POISON_FILE = os.path.join(SAVE_DIR, 'dns_poison_list.txt')
-#LOG_FILE = os.path.join(SAVE_DIR, 'detour.log')
+# LOG_FILE = os.path.join(SAVE_DIR, 'detour.log')
 LOG_FILE = None
 
 WINDOWS_USE_PROACTOR_EVENT_LOOP = False  # do not use, won't work with aiodns
@@ -111,7 +108,10 @@ class SOCKS5Reply(bytes, Enum):
 
 @contextmanager
 def finally_close(writer: asyncio.StreamWriter):
-    """Closes writer on normal context exit and aborts on exception."""
+    """Closes writer on normal context exit and aborts on exception.
+
+    This is Better^{TM} than contextlib.closing because of the additional
+    abort thing."""
     try:
         yield
     except Exception:
@@ -125,6 +125,7 @@ class WithSet(set):
     """A set with a with_this(item) context manager."""
     @contextmanager
     def with_this(self, item):
+        """Add item to self on entry of context, and remove it on exit."""
         if item in self:
             raise KeyError('item {!r} already in set'.format(item))
         self.add(item)
@@ -135,6 +136,10 @@ class WithSet(set):
 
 
 def safe_write_eof(writer: asyncio.StreamWriter):
+    """This is a workaround of a bug in asyncio, where calling write_eof()
+    on a StreamWriter after the transport has been closed by the remote side
+    will raise an AttributeError.
+    """
     if not writer.transport.is_closing():
         writer.write_eof()
 
@@ -195,7 +200,7 @@ class DetourTokenHostEntry:
     TOKEN_SUSTAIN = 1.0
     DETOUR_TOKEN_COUNT = 3
     TEMP_SUSTAIN = 1.0
-    RELEARN_PROBABILITY = 0.01
+    RELEARN_PROBABILITY = 0.001
 
     def __init__(self, is_ip_address=False):
         self._is_ip_address = is_ip_address
@@ -254,12 +259,14 @@ class DetourTokenHostEntry:
         self.detour_tokens = detour_tokens
         self.dns_tokens = dns_tokens
 
-    def __repr__(self):
-        return '<DetourTokenHostEntry: tested_dns_poison {}, try_direct {}, try_altdns {}, detour_tokens {}, pending detour_tokens {}, dns_tokens {}, pending dns_tokens {}>'.format(self.tested_dns_poison, self.try_direct, self.try_altdns, self.detour_tokens, len(self._pending_detour_tokens), self.dns_tokens, len(self._pending_dns_tokens))
-
     def report_dns_poison_test(self, poisoned=None):
+        """Tell me whether this host's DNS records are poisoned.
+
+        poisoned = True: definitely poisoned.
+        poisoned = False: definitely not poisoned.
+        poisoned = None: can't tell for sure.
+        """
         assert not self._is_ip_address
-        # assert not self.tested_dns_poison
         if poisoned is True:
             self.try_direct = False
             self.try_altdns = True
@@ -275,7 +282,8 @@ class DetourTokenHostEntry:
         """Return a list of connection types to try for this host.
 
         Returns a list of (connection_type, needs_token) in reverse order,
-        i.e. the last entry in the list should be attempted first.
+        i.e. the last entry in the list should be attempted first. This is for
+        convenience with list.pop().
         """
         if random.random() < self.RELEARN_PROBABILITY:
             self._relearn()
@@ -494,17 +502,133 @@ class DetourTokenWhitelist:
                     writer.writerow(state)
 
 
+class AltDNSCachedResult:
+    __slots__ = ['result', 'expiry', 'task']
+
+    def __init__(self):
+        self.result = None
+        self.expiry = None
+        self.task  = None
+
+
+AltDNSCacheEntry = namedtuple('AltDNECacheEntry', ['ipv4', 'ipv6'])
+
+
+class AltDNSResolver:
+    MAX_TTL = 3 * 60 * 60
+    DEFAULT_TTL = 60
+
+    def __init__(self, servers, loop=None):
+        self._loop = loop or asyncio.get_event_loop()
+        self._resolver = aiodns.DNSResolver(servers, self._loop)
+        self._cache = defaultdict(self._new_cache_entry)
+        self._logger = logging.getLogger('AltDNSResolver')
+
+    @staticmethod
+    def _new_cache_entry():
+        return AltDNSCacheEntry(AltDNSCachedResult(), AltDNSCachedResult())
+
+    async def getaddrinfo(self, host, port):
+        try:
+            if IPV4_ONLY:
+                return await self._getaddrinfo_ipv4(host, port)
+            if IPV6_ONLY:
+                return await self._getaddrinfo_ipv6(host, port)
+        except aiodns.error.DNSError as e:
+            raise UpstreamConnectError(SOCKS5Reply.HOST_UNREACHABLE,
+                                       'DNS resolution failed') from e
+        ipv4_task = asyncio.ensure_future(
+            self._getaddrinfo_ipv4(host, port), loop=self._loop)
+        ipv6_task = asyncio.ensure_future(
+            self._getaddrinfo_ipv6(host, port), loop=self._loop)
+        try:
+            await asyncio.wait((ipv4_task, ipv6_task), loop=self._loop)
+        except asyncio.CancelledError:
+            ipv4_task.cancel()
+            ipv6_task.cancel()
+            raise
+        exceptions = {}
+        try:
+            ipv4_addrinfo = ipv4_task.result()
+        except aiodns.error.DNSError as e:
+            ipv4_addrinfo = []
+            exceptions['IPv4'] = e
+        try:
+            ipv6_addrinfo = ipv6_task.result()
+        except aiodns.error.DNSError as e:
+            ipv6_addrinfo = []
+            exceptions['IPv6'] = e
+        if IPV6_FIRST:
+            addrinfo = list(roundrobin(ipv6_addrinfo, ipv4_addrinfo))
+        else:
+            addrinfo = list(roundrobin(ipv4_addrinfo, ipv6_addrinfo))
+        if not addrinfo:
+            raise UpstreamConnectError(SOCKS5Reply.HOST_UNREACHABLE,
+                                       'DNS resolution failed: %r' % exceptions)
+        return addrinfo
+
+    async def _resolve_and_cache(self, host, query_type,
+                                 cache: AltDNSCachedResult):
+        self._logger.debug('Making DNS %s request for %s', query_type, host)
+        res = await self._resolver.query(host, query_type)
+        addresses = [r.host for r in res]
+        if not addresses:
+            timeout = self.DEFAULT_TTL + self._loop.time()
+        else:
+            timeout = min(res[0].ttl, self.MAX_TTL) + self._loop.time()
+        self._logger.debug('DNS %s request for %s results: %r',
+                           query_type, host, addresses)
+        cache.result = addresses
+        cache.expiry = timeout
+        return addresses
+
+    async def _get_addresses(self, host, query_type, cache: AltDNSCachedResult):
+        if cache.result is not None:
+            assert cache.expiry is not None
+            if cache.expiry > self._loop.time():
+                self._logger.debug('Retrieved %s records for %s from cache',
+                                   query_type, host)
+                return cache.result
+            else:
+                cache.result = None
+                self._logger.debug('Removed expired %s records for %s '
+                                   'from cache', query_type, host)
+        if cache.task is not None and not cache.task.done():
+            self._logger.debug('Awaiting ongoing %s resolution task for %s',
+                               query_type, host)
+            return await cache.task
+        else:
+            self._logger.debug('Creating %s resolution task for %s',
+                               query_type, host)
+            cache.task = self._loop.create_task(
+                self._resolve_and_cache(host, query_type, cache))
+            return await cache.task
+
+    async def _getaddrinfo_ipv4(self, host, port):
+        addresses = await self._get_addresses(host, 'A', self._cache[host].ipv4)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, '', (addr, port))
+                for addr in addresses]
+
+    async def _getaddrinfo_ipv6(self, host, port):
+        addresses = await self._get_addresses(host, 'AAAA',
+                                              self._cache[host].ipv6)
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 0, '', (addr, port))
+                for addr in addresses]
+
+
 class DetourProxy:
 
     RELAY_BUFFER_SIZE = 2 ** 13
-    DETOUR_TIMEOUT = 3
+    NEXT_METHOD_DELAY = 3
+    NEXT_SOCKET_DELAY = 1
 
     def __init__(self, loop: asyncio.AbstractEventLoop,
                  listen_host, listen_port, alt_dns_servers,
                  upstream_addr, detour_whitelist=None):
         self._loop = loop
         self._logger = logging.getLogger('DetourProxy')
-        self._resolver = aiodns.DNSResolver(alt_dns_servers, loop)
+        # self._resolver = aiodns.DNSResolver(alt_dns_servers, loop)
+        self._resolver = AltDNSResolver(alt_dns_servers, loop)
         self._upstream_addr = upstream_addr
         self._whitelist = detour_whitelist or DetourTokenWhitelist()
         self._dns_poison_ip = set()
@@ -530,7 +654,9 @@ class DetourProxy:
     def load_dns_poison_ip(self, ips):
         self._dns_poison_ip.update(ipaddress.ip_address(a) for a in ips)
 
-    async def _open_connections_parallel(self, addrinfo_list, delay=0.3):
+    async def _open_connections_parallel(self, addrinfo_list, delay=None):
+        if delay is None:
+            delay = self.NEXT_SOCKET_DELAY
         pending = set()
         connected_sock = None
         exceptions = []
@@ -701,7 +827,8 @@ class DetourProxy:
         if need_token:
             assert host_entry is not None, 'need_token but host_entry is None'
             token = host_entry.get_dns_token()
-        addrinfo_list = await self._getaddrinfo_altdns(uhost, uport)
+        #addrinfo_list = await self._getaddrinfo_altdns(uhost, uport)
+        addrinfo_list = await self._resolver.getaddrinfo(uhost, uport)
         if not addrinfo_list:
             raise UpstreamConnectError(SOCKS5Reply.HOST_UNREACHABLE,
                                        'DNS resolution result empty')
@@ -1032,7 +1159,7 @@ DetourProxy as a SOCKS5 proxy instead.
 
                         if connections:
                             delay_fut = asyncio.ensure_future(asyncio.sleep(
-                                    self.DETOUR_TIMEOUT, loop=self._loop),
+                                    self.NEXT_METHOD_DELAY, loop=self._loop),
                                 loop=self._loop)
                             pending.add(delay_fut)
 
@@ -1103,19 +1230,23 @@ DetourProxy as a SOCKS5 proxy instead.
                     pass
                 await self._server_reply_socks5(dwriter, SOCKS5Reply.SUCCESS,
                                                 bind_host, bind_port)
+
+                log_name = '{!r} <=> ({!r}, {!r}) [{}]'.format(
+                    dwriter.transport.get_extra_info('peername'),
+                    uhost, uport, connected_type)
                 try:
                     await self._relay_data(dreader, dwriter,
                                            ureader, uwriter,
                                            (uhost, uport))
                 except UpstreamRelayError as e:
                     self._logger.info(
-                        '%s %s upstream relay error: <%r> caused by <%r>',
-                        log_name, connected_type, e, e.__cause__)
+                        '%s upstream relay error: <%r> caused by <%r>',
+                        log_name, e, e.__cause__)
                     if host_entry is not None:
                         host_entry.report_relay_failure(connected_type)
                     return
-                self._logger.info('%s %s completed normally',
-                                  log_name, connected_type)
+                self._logger.info('%s completed normally',
+                                  log_name)
                 if host_entry is not None:
                     host_entry.report_relay_success(connected_type,
                                                     connected_token)
@@ -1261,8 +1392,8 @@ def relay():
         file_handler.setFormatter(file_formatter)
         rootlogger.addHandler(file_handler)
 
-    # logging.getLogger('asyncio').setLevel(logging.DEBUG)
-    # logging.getLogger('DetourProxy').setLevel(logging.INFO)
+    # logging.getLogger('asyncio').setLevel(logging.INFO)
+    # logging.getLogger('DetourProxy').setLevel(logging.DEBUG)
     logging.captureWarnings(True)
     warnings.filterwarnings('always')
 

@@ -1,12 +1,12 @@
 # detour-proxy-advance
 
-A piece of software that makes circumventing Internet censorship more convenient. This does not provide circumvention by itself, but it can be used to automatically detour connections to blocked websites.
+Makes circumventing Internet censorship more convenient. Blocked sites are automatically detected and routed through a proxy, while unblocked sites are visited directly.
 
 ## Motivation
 
-There are many useful tools that help people visit websites blocked by a national censor. [Lantern](https://getlantern.org/) is an interesting "batteries included" solution, in that it handles all requests, tries to connect directly first, and only use their relay if the website is detected to be blocked. This way, connections to non-blocked websites are not needlessly routed through the relay, and there's no need to manually maintain a list of blocked sites.
+There are many useful tools that help people visit websites blocked by a national censor. [Lantern](https://getlantern.org/) is an interesting solution, in that it handles all requests, tries to connect directly first, and only use their relay if the website is detected to be blocked. This way, connections to non-blocked websites are not needlessly routed through the relay, and the user do no have to manually maintain a list of blocked sites.
 
-For people who don't want to use Lantern, perhaps those who prefer to roll their own circumvention solution, but still want the convenience of automatic detouring, I present to you this project, Detour Proxy Advance. 
+For people who want to roll their own circumvention solution, but still desire Lantern's convenience, this project might be the missing piece of the puzzle.
 
 ## What it does
 
@@ -14,29 +14,27 @@ For people who don't want to use Lantern, perhaps those who prefer to roll their
 
 Two types of website censorship are considered here:
 
-- DNS poisoning. When a DNS lookup is done for the censored website, wrong IP addresses are returned, and connections to these erroneous IP addresses naturally fail. If the correct IP addresses are obtained by another method, however, connections to those addresses complete successfully.
+- DNS poisoning. When a user attempts to visit a censored website, the browser does a DNS lookup for the website's host name, and the censor injects incorrect "poisoned" IP addresses in the response, so that the browser connects to a wrong address and fail. If the correct IP addresses are obtained by another method, however, direct connections to those addresses complete successfully.
 
-- TCP connection interruption. When a TCP connection to the website is made, the censor interrupts the connection, either by blocking packets or sending RST packets to the client, causing the connection to fail.
+- TCP connection interruption. When a TCP connection to the website is made, the censor interrupts the connection, either by dropping packets or sending TCP RST packets to the client, causing the connection to fail.
 
 (Note that this tool currently does not recognize TCP hijacking, where the censor inserts false data into the connection in order to display a notice or redirect the client's browser. Such methods are known to be used in Iran and South Korea, for example.)
 
 ### Circumvention logic
 
-This tool makes 3 types of outgoing TCP connections:
+In order to fight the cersorship methods outlined above, this tool attemtps 3 different methods of connecting to the target website:
 
 - Direct connection. Do name resolution using OS-provided methods, and connect directly to the resolved address(es).
-- Alternate DNS connection. Do name resolution using a DNS server guaranteed to return authentic results, and connect directly to the resolved address(es).
-- Detoured connection. Make the connection through a relay, known to be unaffected by censorship.
+- Alternate DNS connection. Do name resolution using a DNS server guaranteed to return authentic results, and connect directly to the resolved address(es). This defeats DNS poisoning.
+- Detoured connection. Make the connection through a relay, known to be unaffected by censorship. This defeats connection interruption.
 
-When connecting to a host name, this tool attempts to connect using all 3 methods, in this order, with a delay in between. Whichever connection succeeds is used. If one type of connection succeeds multiple times consistently, it is remembered, and connection types before the winning one is no longer attempted.
-
-If a connection succeeds, but is then interrupted, this connection method is marked temporarily unavailable, and the next connection attempt will only try methods after the current method.
+When connecting to a given host name, this tool attempts all 3 methods, in the given order, with a delay in between. Whichever connection succeeds first is used, and the method that works consistently is learned. Future connections to the same site will skip methods that don't work.
 
 There is some additional logic to deal with the case where DNS for a certain host is known to be / known not to be poisoned, when connecting to an IP address where DNS resolution is not necessary, and to occasionally re-learn the best connection method.
 
-The end result is that, most censored websites will simply work, and those that doesn't work the first time starts working after a few refreshes.
+The end result is that, censored websites either work right away, or starts working after a few refreshes. Uncensored sites work just like before, with no slowdowns.
 
-## Usage
+## How to use it
 
 ### Requirements
 
@@ -44,31 +42,44 @@ The following are required to use Detour Proxy Advance:
 
 - Python 3.5 or higher.
 - The `aiodns` Python package.
-- A DNS server known to return authentic, non-poisoned IP addresses. This can be a DNS server across a VPN link, a DNSCrypt Proxy, etc.
-- A SOCKS5 proxy server known to reach censored websites. This can be a SOCKS5 proxy server across a VPN link, a SOCKS5 proxy tunneled using `stunnel` or `obfs4proxy`, a SSH connection with dynamic forwarding, etc. (Currently only non-authenticated proxies are supported.)
-- Some experience in Python.
+- A SOCKS5 proxy server that can reach censored websites. This can be anything that presents a SOCKS5 server with no user authentication: a plain proxy server, a proxy server tunneled through a VPN, `stunnel` or `obfs4proxy`, a SSH connection with dynamic forwarding, etc. (Proxies with user authentication are not supported.)
+- Strongly recommended: A DNS server that returns authentic, non-poisoned IP addresses. This can be a DNS server across a VPN link, a DNSCrypt Proxy, etc. If one is not available, a separate tool can be used to tunnel DNS requests through the same proxy used to visit censored websites.
 
-### Configuration
+### Configuration and usage
 
-Complete these configuration steps before using:
+The script is now configured using command line arguments. Run the script with argument "--help" to see detailed usage. At the very least, the IP address / host name of the upstream SOCKS5 proxy must be specified.
 
-- Edit variables in the configuration section near the top of the script to set (at least) your DNS server, upstream proxy, and the local address / port to listen on.
-- Optionally, prepare a list of known IP addresses used in poisoned DNS replies and put it in `dns_poison_ip.txt` in the same directory as the script.
-- Optionally, prepare a file `persistent.txt` that contains domains / IP addresses that should always use a certain connection method.
-- Configure your browser's SOCKS5 proxy setting to point to the listen address set above, and make sure to turn on "remote DNS resolution" or any similar option.
+By default, the script reads and writes several files in the working directory. Different paths / filenames can be specified as command line arguments.
 
-### Running the script
+- `dns_poison_ip.txt` contains a list of known IP addresses used in poisoned DNS replies. If a DNS lookup done by the OS returns one of these addresses, it is assumed that the host name is under DNS poisoning.
+- `persistent.txt` contains host names / IP addresses that should always use a certain connection method. See the provided file for examples and comments.
+- `state.csv` stores information learned about censored sites.
 
-Just run it!
+Run the script with the appropriate arguments, set your browser to use a SOCKS5 proxy at 127.0.0.1:1080 or whatever address:port specified using `--bind` and `--bind-port` arguments, and browse away.
 
-Some files will be saved to the same directory as the script by default.
+### If a convenient uncensored DNS server is not available
 
-## Some out-of-scope stuff
+The script can be configured to do DNS lookups using TCP, and a separate tool can be used to direct these lookups through the SOCKS5 proxy server to a public DNS server. For example, `socat` 2.0+ can be used like this:
 
-Occasionally I may add new features to this script. Here I list a few features that I believe should *not* be part of this script, and how they can be achieved using other tools.
+    socat "tcp-listen:53,bind=127.0.0.1,fork,reuseaddr" "socks5:8.8.8.8:53|tcp-connect:192.168.2.1:1080"
+
+to listen for (TCP) DNS queries on 127.0.0.1:53, forward them through the SOCKS5 proxy at 192.168.2.1:1080 to Google's public DNS server at 8.8.8.8:53. Then, configure the script with `--dns 127.0.0.1 --dns-tcp`.
+
+Performance will take a hit with this method, since each DNS lookup incurs the additional overhead of a TCP connection through the proxy.
+
+## Future plans
+
+Having to use a separate DNS server is indeed clunky. My immediate plan for this project is to make it easier and faster to do DNS lookups through the proxy, without using additional tools. Features required:
+
+- Routing TCP DNS lookups through proxy
+- DNS TCP pipelining
+
+### Features that will not be added
+
+Here are a few features I believe should *not* be part of this script, and how they can be achieved using other tools.
 
 #### HTTP proxy support
 
-HTTP proxies are *complicated*. There are so many corner cases this thing must have a fractal shape, so I am not going to try cramming it into a single script.
+HTTP proxies are *complicated*. There are so many corner cases, it's probably shaped after a Koch snowflake (hehe), so I am not going to try cramming it into a single script.
 
-To use Detour Proxy Advance with things that can only use an HTTP proxy, put an HTTP proxy in front, and set Detour Proxy Advance as its upstream. [TinyProxy](https://tinyproxy.github.io/) (git version), [Privoxy](https://www.privoxy.org/), [Polipo](https://www.irif.fr/~jch/software/polipo/), [3proxy](https://3proxy.ru/) should all work. (Just a note: none of these support non-TLS WebSocket connections. Privoxy and Polipo both fall on their faces if the upstream proxy returns an IPv6 bind address.)
+To use Detour Proxy Advance with clients that can only use an HTTP proxy, put an HTTP proxy in front, and set Detour Proxy Advance as its upstream. [TinyProxy](https://tinyproxy.github.io/) (git version), [Privoxy](https://www.privoxy.org/), [Polipo](https://www.irif.fr/~jch/software/polipo/), [3proxy](https://3proxy.ru/) should all work. (Just a note: none of these support non-TLS WebSocket connections. Privoxy and Polipo both fall on their faces if the upstream proxy returns an IPv6 bind address.)

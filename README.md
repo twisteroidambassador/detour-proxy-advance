@@ -43,7 +43,7 @@ The following are required to use Detour Proxy Advance:
 - Python 3.5 or higher.
 - The `aiodns` Python package.
 - A SOCKS5 proxy server that can reach censored websites. This can be anything that presents a SOCKS5 server with no user authentication: a plain proxy server, a proxy server tunneled through a VPN, `stunnel` or `obfs4proxy`, a SSH connection with dynamic forwarding, etc. (Proxies with user authentication are not supported.)
-- Strongly recommended: A DNS server that returns authentic, non-poisoned IP addresses. This can be a DNS server across a VPN link, a DNSCrypt Proxy, etc. If one is not available, a separate tool can be used to tunnel DNS requests through the same proxy used to visit censored websites.
+- Strongly recommended: A DNS server that returns authentic, non-poisoned IP addresses. This can be a local DNS proxy utilizing one of the encrypted protocols (DNSCrypt, DNS over TLS, DNS over HTTPS, etc.), a DNS server across a VPN link, etc. If one is not available, a separate tool can be used to tunnel DNS requests through the same proxy used to visit censored websites.
 
 ### Configuration and usage
 

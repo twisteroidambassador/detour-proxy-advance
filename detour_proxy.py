@@ -1364,8 +1364,8 @@ def noop_callback(loop, delay):
     loop.call_later(delay, noop_callback, loop, delay)
 
 
-def sigterm_handler(sig, frame):
-    logging.warning('Received signal %r', sig)
+def sigterm_handler():
+    logging.warning('Received SIGTERM, exiting')
     sys.exit(0)
 
 
@@ -1505,7 +1505,6 @@ def relay():
 
     windows_async_signal_helper(loop)
     try:
-        loop.add_signal_handler(signal.SIGINT, sigterm_handler)
         loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
     except NotImplementedError:
         pass

@@ -41,9 +41,9 @@ The end result is that, censored websites either work right away, or starts work
 The following are required to use Detour Proxy Advance:
 
 - Python 3.5 or higher.
-- The `aiodns` Python package.
+- The `dnspython` Python package.
 - A SOCKS5 proxy server that can reach censored websites. This can be anything that presents a SOCKS5 server with no user authentication: a plain proxy server, a proxy server tunneled through a VPN, `stunnel` or `obfs4proxy`, a SSH connection with dynamic forwarding, etc. (Proxies with user authentication are not supported.)
-- Strongly recommended: A DNS server that returns authentic, non-poisoned IP addresses. This can be a local DNS proxy utilizing one of the encrypted protocols (DNSCrypt, DNS over TLS, DNS over HTTPS, etc.), a DNS server across a VPN link, etc. If one is not available, a separate tool can be used to tunnel DNS requests through the same proxy used to visit censored websites.
+- Optional: A DNS server that returns authentic, non-poisoned IP addresses. This can be a local DNS proxy utilizing one of the encrypted protocols (DNSCrypt, DNS over TLS, DNS over HTTPS, etc.), a DNS server across a VPN link, etc. If one is not available, Detour Proxy Advance can use the upstream SOCKS5 proxy to reach a public DNS service.
 
 ### Configuration and usage
 
@@ -51,7 +51,7 @@ The script is now configured using command line arguments. Run the script with a
 
 By default, the script reads and writes several files in the working directory. Different paths / filenames can be specified as command line arguments.
 
-- `dns_poison_ip.txt` contains a list of known IP addresses used in poisoned DNS replies. If a DNS lookup done by the OS returns one of these addresses, it is assumed that the host name is under DNS poisoning.
+- `dns_poison_ip.txt` contains a list of known IP addresses used in poisoned DNS replies. If a DNS lookup done by the OS returns one of these addresses, it is assumed that the host name is under DNS poisoning. (This file is located in the same directory as the script by default.)
 - `persistent.txt` contains host names / IP addresses that should always use a certain connection method. See the provided file for examples and comments.
 - `state.csv` stores information learned about censored sites.
 
@@ -59,20 +59,11 @@ Run the script with the appropriate arguments, set your browser to use a SOCKS5 
 
 ### If a convenient uncensored DNS server is not available
 
-The script can be configured to do DNS lookups using TCP, and a separate tool can be used to direct these lookups through the SOCKS5 proxy server to a public DNS server. For example, `socat` 2.0+ can be used like this:
-
-    socat "tcp-listen:53,bind=127.0.0.1,fork,reuseaddr" "socks5:8.8.8.8:53|tcp-connect:192.168.2.1:1080"
-
-to listen for (TCP) DNS queries on 127.0.0.1:53, forward them through the SOCKS5 proxy at 192.168.2.1:1080 to Google's public DNS server at 8.8.8.8:53. Then, configure the script with `--dns 127.0.0.1 --dns-tcp`.
-
-Performance will take a hit with this method, since each DNS lookup incurs the additional overhead of a TCP connection through the proxy.
+The script is now able to use a DNS server through the upstream proxy natively, without 3rd-party tools. If none of the DNS-related command line arguments are specified, the script will use the configured upstream proxy to reach CloudFlare's public DNS service (1.1.1.1) and use that. With DNS TCP pipelining, the overhead should be minimized.
 
 ## Future plans
 
-Having to use a separate DNS server is indeed clunky. My immediate plan for this project is to make it easier and faster to do DNS lookups through the proxy, without using additional tools. Features required:
-
-- Routing TCP DNS lookups through proxy
-- DNS TCP pipelining
+DNS over TLS might be a good feature to implement, but 1) DNS over TLS through proxy won't be possible until asyncio adds STARTTLS and 2) there's no way to do SPKI fingerprint verification without bringing in another dependency.
 
 ### Features that will not be added
 

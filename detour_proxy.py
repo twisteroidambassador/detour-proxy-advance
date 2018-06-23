@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 
-# Copyright 2017 twisteroid ambassador
+# Copyright 2017, 2018 twisteroid ambassador
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,6 +18,7 @@
 import argparse
 import asyncio
 import csv
+import enum
 import errno
 import ipaddress
 import itertools
@@ -29,9 +30,8 @@ import socket
 import sys
 import time
 import warnings
-from collections import defaultdict, Counter, namedtuple
+from collections import defaultdict, Counter, namedtuple, OrderedDict
 from contextlib import ExitStack, contextmanager, suppress
-from enum import Enum
 from functools import partial
 from typing import Dict, Union, Tuple, List, Iterable, Callable, Any, \
     Optional, Awaitable
@@ -61,14 +61,22 @@ WINDOWS_USE_PROACTOR_EVENT_LOOP = True
 # Privoxy and Polipo are known to have this problem.
 SOCKS5_RETURN_FAKE_BIND_ADDR = False
 
+# When negotiating SOCKS5 with the upstream proxy, do not wait for the server
+# to confirm our choice of "no authentication" and send our CONNECT command
+# preemptively. This violates RFC 1928 and may potentially make proxy servers
+# freak out, but saves one RTT during connection creation.
+SOCKS5_PREEMPTIVE_COMMAND = True
+
 # Maximum amount of time (in seconds) a DNS resolution result will be cached.
 # Set None for no maximum.
 RESOLVER_CACHE_MAX_TTL = 60 * 60
 # ========== End of configuration section ==========
 
 INADDR_ANY = ipaddress.IPv4Address(0)
+SOCKS4A_INVALID_IP = ipaddress.IPv4Network('0.0.0.0/24')
 
 IPAddressType = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+HostType = Union[str, ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 WINDOWS = sys.platform == 'win32'
 
@@ -94,11 +102,10 @@ def monkey_patch_write_eof():
 monkey_patch_write_eof()
 
 
-def roundrobin(*iterables):
-    # Restriction: iterables must not contain None
-    return (e for e in
-            itertools.chain.from_iterable(itertools.zip_longest(*iterables))
-            if e is not None)
+def roundrobin(*iterables, _sentinel=object()):
+    """roundrobin('ABC', 'D', 'EF') --> A D E B F C"""
+    return (e for e in itertools.chain.from_iterable(itertools.zip_longest(
+        *iterables, fillvalue=_sentinel)) if e is not _sentinel)
 
 
 # See implementation of current_task() in async-timeout; this does not
@@ -133,29 +140,16 @@ class Timeout:
         self._cancel_handler = None
         self._cancel_at = None
 
-    async def __aenter__(self):
-        return self._do_enter()
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return self._do_exit(exc_type)
-
-    @property
-    def expired(self):
-        return self._cancelled
-
-    @property
-    def remaining(self):
-        if self._cancel_at is not None:
-            return max(self._cancel_at - self._loop.time(), 0.0)
-        else:
-            return None
-
     def cancel_timeout(self):
         if self._timeout is not None and self._cancel_handler is not None:
             self._cancel_handler.cancel()
             self._cancel_handler = None
 
-    def _do_enter(self):
+    def _cancel_task(self):
+        self._task.cancel()
+        self._cancelled = True
+
+    async def __aenter__(self):
         # Support Tornado 5- without timeout
         # Details: https://github.com/python/asyncio/issues/392
         if self._timeout is None:
@@ -175,7 +169,7 @@ class Timeout:
             self._cancel_at, self._cancel_task)
         return self
 
-    def _do_exit(self, exc_type):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type is asyncio.CancelledError and self._cancelled:
             self._cancel_handler = None
             self._task = None
@@ -185,31 +179,31 @@ class Timeout:
         self.cancel_timeout()
         self._task = None
 
-    def _cancel_task(self):
-        self._task.cancel()
-        self._cancelled = True
+
+class BytesEnum(bytes, enum.Enum):
+    pass
 
 
-class SOCKS5AuthType(bytes, Enum):
+class SOCKS5AuthType(BytesEnum):
     NO_AUTH = b'\x00'
     GSSAPI = b'\x01'
     USERNAME_PASSWORD = b'\x02'
     NO_OFFERS_ACCEPTABLE = b'\xff'
 
 
-class SOCKS5Command(bytes, Enum):
+class SOCKS5Command(BytesEnum):
     CONNECT = b'\x01'
     BIND = b'\x02'
     UDP_ASSOCIATE = b'\x03'
 
 
-class SOCKS5AddressType(bytes, Enum):
+class SOCKS5AddressType(BytesEnum):
     IPV4_ADDRESS = b'\x01'
     DOMAIN_NAME = b'\x03'
     IPV6_ADDRESS = b'\x04'
 
 
-class SOCKS5Reply(bytes, Enum):
+class SOCKS5Reply(BytesEnum):
     SUCCESS = b'\x00'
     GENERAL_FAILURE = b'\x01'
     CONNECTION_NOT_ALLOWED_BY_RULESET = b'\x02'
@@ -219,6 +213,18 @@ class SOCKS5Reply(bytes, Enum):
     TTL_EXPIRED = b'\x06'
     COMMAND_NOT_SUPPORTED = b'\x07'
     ADDRESS_TYPE_NOT_SUPPORTED = b'\x08'
+
+
+class SOCKS4Command(BytesEnum):
+    CONNECT = b'\x01'
+    BIND = b'\x02'
+
+
+class SOCKS4Reply(BytesEnum):
+    GRANTED = b'\x5A'
+    REJECTED_FAILED = b'\x5B'
+    NO_IDENTD = b'\x5C'
+    IDENTD_MISMATCH = b'\x5D'
 
 
 @contextmanager
@@ -235,13 +241,6 @@ def finally_close(writer: asyncio.StreamWriter):
         raise
     finally:
         writer.close()
-
-
-def get_enum(enum_type, value):
-    try:
-        return enum_type(value)
-    except ValueError:
-        return value
 
 
 # https://github.com/twisteroidambassador/async_stagger
@@ -337,8 +336,8 @@ async def staggered_race(
             # here and CancelledError are usually thrown at one, we will
             # encounter a curious corner case where the current task will end
             # up as done() == True, cancelled() == False, exception() ==
-            # asyncio.CancelledError, which is normally not possible.
-            # https://bugs.python.org/issue33413
+            # asyncio.CancelledError.
+            # https://bugs.python.org/issue30048
             for i, t in enumerate(tasks):
                 if i != this_index:
                     t.cancel()
@@ -396,6 +395,16 @@ class DetourException(Exception):
     pass
 
 
+class UpstreamConnectionError(DetourException):
+    """Error while connecting to the destination."""
+    pass
+
+
+class DownstreamNegotiationError(DetourException):
+    """Error while negotiating with downstream clients."""
+    pass
+
+
 class RelayError(DetourException):
     """Network error while relaying."""
     pass
@@ -403,11 +412,6 @@ class RelayError(DetourException):
 
 class UpstreamRelayError(RelayError):
     """Network error in the upstream connection while relaying."""
-    pass
-
-
-class DownstreamNegotiationError(DetourException):
-    """Error while negotiating with downstream clients."""
     pass
 
 
@@ -420,7 +424,7 @@ class SOCKS5Error(DetourException):
     pass
 
 
-class ConnectionType(Enum):
+class ConnectionType(enum.Enum):
     DIRECT = 'direct'
     ALTDNS = 'altdns'
     DETOUR = 'detour'
@@ -731,7 +735,9 @@ class DetourTokenWhitelist:
             try:
                 connection = ConnectionType(state)
             except ValueError as e:
-                self._logger.warning('Persistent file line "%s": %r', line, e)
+                self._logger.warning(
+                    'Invalid connection type in persistent file line "%s": %r',
+                    line, e)
                 continue
             try:
                 ip = ipaddress.ip_network(host)
@@ -739,8 +745,9 @@ class DetourTokenWhitelist:
                 try:
                     hostname = dns.name.from_text(host)
                 except dns.exception.DNSException as e:
-                    self._logger.warning('Persistent file line "%s": %r',
-                                         line, e)
+                    self._logger.warning(
+                        'Invalid host name in persistent file line "%s": %r',
+                        line, e)
                     continue
                 self._persistent[hostname] = connection
             else:
@@ -757,7 +764,7 @@ class DetourTokenWhitelist:
                         host = dns.name.from_text(record['host'])
                     except dns.exception.DNSException as e:
                         self._logger.warning(
-                            'State file record %r has invalid host name: %r',
+                            'Invalid host name in state file record %r: %r',
                             record, e)
                         continue
                     host_entry = self._hosts[host]
@@ -1043,9 +1050,8 @@ class BaseQuerier:
                     assert min_ttl != float('inf')
                     return addresses, min_ttl
         elif response.rcode() != dns.rcode.NXDOMAIN:
-            self._logger.error('DNS response has RCODE %s',
-                               dns.rcode.to_text(response.rcode()))
-            return [], 0
+            raise socket.gaierror('DNS response has RCODE {}'.format(
+                dns.rcode.to_text(response.rcode())))
         # either NXDOMAIN or NODATA: check SOA record for ttl
         current_name = qname
         while True:
@@ -1257,7 +1263,8 @@ class TCPPipeliningQuerier(BaseQuerier):
             self._reader, self._writer = await self.connector(
                 self._server, self._port, loop=self._loop)
         except (OSError, EOFError) as e:
-            self._logger.warning('TCP connection failed: %r', e)
+            self._logger.warning('TCP connection failed: %r',
+                                 ExceptionCausePrinter(e))
             # self._reader = self._writer = None
             raise
         finally:
@@ -1336,7 +1343,7 @@ class TCPPipeliningQuerier(BaseQuerier):
         except asyncio.CancelledError:
             self._logger.debug('Receive task cancelled')
         except Exception:
-            self._logger.info('Receive task caught exception', exc_info=True)
+            self._logger.warning('Receive task caught exception', exc_info=True)
         finally:
             self._reader = self._writer = None
             writer.close()
@@ -1347,8 +1354,8 @@ class TCPPipeliningQuerier(BaseQuerier):
             self._receive_task = None
             self._cancel_idle_timeout()
 
-    async def _send_query(self, query_msg: dns.message.Message) \
-            -> dns.message.Message:
+    async def _send_query(self, query_msg: dns.message.Message
+                          ) -> dns.message.Message:
         await self._ensure_connected()
         self._cancel_idle_timeout()
         query_wire = query_msg.to_wire()
@@ -1397,7 +1404,7 @@ class TCPPipeliningQuerier(BaseQuerier):
 
 SuccessfulConnection = namedtuple(
     'SuccessfulConnection',
-    ['reader', 'writer', 'host_entry', 'conn_type', 'token'])
+    ['reader', 'writer', 'host_entry', 'conn_type', 'token', 'bindaddr'])
 
 
 class DetourProxy:
@@ -1440,6 +1447,23 @@ class DetourProxy:
         self._logger.info('DetourProxy listening on %r',
                           [s.getsockname() for s in self._server.sockets])
 
+    async def stop(self):
+        """Terminate the server and all active connections."""
+        if self._server is None:
+            raise RuntimeError('DetourProxy is not running')
+        self._logger.info('DetourProxy closing')
+        self._server.close()
+        await self._server.wait_closed()
+        self._logger.info('Listening socket closed')
+        if self._connections:
+            for conn in self._connections:
+                conn.cancel()
+            done, _ = await asyncio.wait(self._connections, loop=self._loop)
+            for d in done:
+                if not d.cancelled() and d.exception():
+                    self._logger.error('Exception in closed connection',
+                                       exc_info=d.exception())
+
     def load_dns_poison_ip(self, ips):
         self._dns_poison_ip.update(ipaddress.ip_address(a) for a in ips)
 
@@ -1461,6 +1485,21 @@ class DetourProxy:
             self._logger.debug('Connecting to %r failed: %r', addr, e)
             raise
 
+    async def _getaddrinfo_native(self, host, port, family=socket.AF_UNSPEC):
+        """Happy Eyeballs-appropriate getaddrinfo(). Reorders addresses."""
+        addrinfos = await self._loop.getaddrinfo(
+            host, port, family=family, type=socket.SOCK_STREAM)
+        if family == socket.AF_UNSPEC:
+            addrinfos_by_family = OrderedDict()
+            for addr in addrinfos:
+                family = addr[0]
+                if family not in addrinfos_by_family:
+                    addrinfos_by_family[family] = []
+                addrinfos_by_family[family].append(addr)
+            addrinfos_lists = list(addrinfos_by_family.values())
+            addrinfos = list(roundrobin(*addrinfos_lists))
+        return addrinfos
+
     async def _open_connections_parallel(self, addrinfo_list, delay=None):
         if delay is None:
             delay = self.NEXT_SOCKET_DELAY
@@ -1481,34 +1520,43 @@ class DetourProxy:
                           ', '.join(repr(e) for e in exceptions))
         raise exceptions[-1]
 
-    def _map_exception_to_socks5_reply(self, exc):
-        if isinstance(exc, SOCKS5Error):
-            return exc.args[0]
-        if isinstance(exc, socket.gaierror):
-            return SOCKS5Reply.HOST_UNREACHABLE
-        if isinstance(exc, TimeoutError):
-            return SOCKS5Reply.TTL_EXPIRED
-        if isinstance(exc, ConnectionRefusedError):
-            return SOCKS5Reply.CONNECTION_REFUSED
-        if isinstance(exc, OSError):
-            if exc.errno == errno.ENETUNREACH:
-                return SOCKS5Reply.NETWORK_UNREACHABLE
-            elif exc.errno == errno.EHOSTUNREACH:
-                return SOCKS5Reply.HOST_UNREACHABLE
-            elif exc.errno == errno.ECONNREFUSED:
-                return SOCKS5Reply.CONNECTION_REFUSED
-            elif exc.errno == errno.ETIMEDOUT:
-                return SOCKS5Reply.TTL_EXPIRED
-            elif WINDOWS and exc.winerror == 121:
-                # OSError: [WinError 121] The semaphore timeout period has
-                # expired
-                # Looks like this exception instead of TimeoutError is raised
-                # by ProactorEventLoop
-                return SOCKS5Reply.TTL_EXPIRED
-        if isinstance(exc, ConnectionError):
-            return SOCKS5Reply.GENERAL_FAILURE
-        self._logger.warning('Unexpected exception', exc_info=True)
-        return SOCKS5Reply.GENERAL_FAILURE
+    async def _make_direct_connection(self, uhost, uport,
+                                      host_entry: DetourTokenHostEntry,
+                                      need_token):
+        assert not need_token
+        if isinstance(uhost, ipaddress.IPv4Address):
+            if self._ipv6_only:
+                raise ConnectionError(
+                    errno.EHOSTUNREACH,
+                    'Cannot connect to IPv4 address when ipv6_only is set')
+            addrinfo_list = [(socket.AF_INET, socket.SOCK_STREAM, 0, '',
+                              (uhost.compressed, uport))]
+        elif isinstance(uhost, ipaddress.IPv6Address):
+            if self._ipv4_only:
+                raise ConnectionError(
+                    errno.EHOSTUNREACH,
+                    'Cannot connect to IPv6 address when ipv4_only is set')
+            addrinfo_list = [(socket.AF_INET6, socket.SOCK_STREAM, 0, '',
+                              (uhost.compressed, uport))]
+        else:
+            if self._ipv4_only:
+                family = socket.AF_INET
+            elif self._ipv6_only:
+                family = socket.AF_INET6
+            else:
+                family = socket.AF_UNSPEC
+            addrinfo_list = await self._getaddrinfo_native(uhost, uport, family)
+            gai_ips = set(ipaddress.ip_address(a[4][0]) for a in addrinfo_list)
+            if host_entry is not None:
+                if not gai_ips.isdisjoint(self._dns_poison_ip):
+                    host_entry.report_dns_poison_test(True)
+                    raise ConnectionError('DNS poisoning detected')
+                else:
+                    if not host_entry.tested_dns_poison:
+                        host_entry.stash_gai_result = gai_ips
+        r, w = await self._open_connections_parallel(addrinfo_list)
+        sockname = w.get_extra_info('sockname')
+        return r, w, None, sockname
 
     async def _make_alt_dns_connection(self, uhost, uport,
                                        host_entry: DetourTokenHostEntry,
@@ -1542,55 +1590,72 @@ class DetourProxy:
                 host_entry.report_dns_poison_test(None)
             host_entry.stash_gai_result = None
         r, w = await self._open_connections_parallel(addrinfo_list)
-        return r, w, token
+        sockname = w.get_extra_info('sockname')
+        return r, w, token, sockname
 
-    async def _make_direct_connection(self, uhost, uport,
-                                      host_entry: DetourTokenHostEntry,
-                                      need_token):
-        assert not need_token
+    def _socks5_send_connect_command(self, uhost, uport, uwriter):
         if isinstance(uhost, ipaddress.IPv4Address):
-            if self._ipv6_only:
-                raise ConnectionError(
-                    errno.EHOSTUNREACH,
-                    'Cannot connect to IPv4 address when ipv6_only is set')
-            addrinfo_list = [(socket.AF_INET, socket.SOCK_STREAM, 0, '',
-                              (uhost.compressed, uport))]
+            addr = SOCKS5AddressType.IPV4_ADDRESS + uhost.packed
         elif isinstance(uhost, ipaddress.IPv6Address):
-            if self._ipv4_only:
-                raise ConnectionError(
-                    errno.EHOSTUNREACH,
-                    'Cannot connect to IPv6 address when ipv4_only is set')
-            addrinfo_list = [(socket.AF_INET6, socket.SOCK_STREAM, 0, '',
-                              (uhost.compressed, uport))]
+            addr = SOCKS5AddressType.IPV6_ADDRESS + uhost.packed
         else:
-            if self._ipv4_only:
-                family = socket.AF_INET
-            elif self._ipv6_only:
-                family = socket.AF_INET6
+            addr = uhost.encode('idna')
+            addr = (SOCKS5AddressType.DOMAIN_NAME
+                    + len(addr).to_bytes(1, 'big') + addr)
+        uwriter.write(b'\x05' + SOCKS5Command.CONNECT + b'\x00'
+                      + addr + uport.to_bytes(2, 'big'))
+
+    async def _socks5_upstream_negotiate(self, uhost, uport,
+                                         ureader: asyncio.StreamReader,
+                                         uwriter: asyncio.StreamWriter):
+        self._logger.debug('Making upstream SOCKS5 connection to (%r, %r)',
+                           uhost, uport)
+        try:
+            uwriter.write(b'\x05\x01' + SOCKS5AuthType.NO_AUTH)
+            if SOCKS5_PREEMPTIVE_COMMAND:
+                self._socks5_send_connect_command(uhost, uport, uwriter)
+            buf = await ureader.readexactly(2)
+            if buf[0:1] != b'\x05':
+                raise ValueError('Invalid upstream SOCKS5 auth reply')
+            if SOCKS5AuthType(buf[1:2]) is not SOCKS5AuthType.NO_AUTH:
+                raise ValueError('Unsupported upstream SOCKS5 auth type')
+            if not SOCKS5_PREEMPTIVE_COMMAND:
+                self._socks5_send_connect_command(uhost, uport, uwriter)
+            buf = await ureader.readexactly(4)
+            if buf[0:1] != b'\x05' or buf[2:3] != b'\x00':
+                raise ConnectionError(
+                    'Invalid upstream SOCKS5 command response %r' % buf)
+            reply = SOCKS5Reply(buf[1:2])
+            if reply is not SOCKS5Reply.SUCCESS:
+                raise SOCKS5Error(
+                    reply, 'Upstream SOCKS5 server returned error %r' % reply)
+            addr_type = SOCKS5AddressType(buf[3:4])
+            if addr_type is SOCKS5AddressType.IPV4_ADDRESS:
+                bind_host = ipaddress.IPv4Address(await ureader.readexactly(4))
+            elif addr_type is SOCKS5AddressType.IPV6_ADDRESS:
+                bind_host = ipaddress.IPv6Address(await ureader.readexactly(16))
+            elif addr_type is SOCKS5AddressType.DOMAIN_NAME:
+                buf = await ureader.readexactly(1)
+                bind_host = (await ureader.readexactly(buf[0])).decode('utf-8')
             else:
-                family = socket.AF_UNSPEC
-            addrinfo_list = await self._loop.getaddrinfo(
-                uhost, uport, family=family, type=socket.SOCK_STREAM)
-            gai_ips = set(ipaddress.ip_address(a[4][0]) for a in addrinfo_list)
-            if host_entry is not None:
-                if not gai_ips.isdisjoint(self._dns_poison_ip):
-                    host_entry.report_dns_poison_test(True)
-                    raise ConnectionError('DNS poisoning detected')
-                else:
-                    if not host_entry.tested_dns_poison:
-                        host_entry.stash_gai_result = gai_ips
-        r, w = await self._open_connections_parallel(addrinfo_list)
-        return r, w, None
+                raise ValueError('Invalid address type')
+            bind_port = int.from_bytes(await ureader.readexactly(2), 'big')
+            self._logger.debug(
+                'Upstream SOCKS5 connection to (%r, %r) successful, '
+                'bind address: (%r, %r)', uhost, uport, bind_host, bind_port)
+            return bind_host, bind_port
+        except (ValueError, OSError, EOFError) as e:
+            raise ConnectionError('Upstream SOCKS5 connection error') from e
 
     async def _open_connection_detour(self, host, port, **kwargs):
         r, w = await asyncio.open_connection(
             self._upstream_host, self._upstream_port, **kwargs)
         try:
-            await self._client_negotiate_socks5(host, port, r, w)
+            bindaddr = await self._socks5_upstream_negotiate(host, port, r, w)
         except:
             w.transport.abort()
             raise
-        return r, w
+        return r, w, bindaddr
 
     async def open_connection_detour(self, host, port, **kwargs):
         """Open a connection to (host, port) through the upstream proxy.
@@ -1600,7 +1665,9 @@ class DetourProxy:
         **kwargs are passed to asyncio.open_connection().
         """
         try:
-            return await self._open_connection_detour(host, port, **kwargs)
+            r, w, bindaddr = await self._open_connection_detour(
+                host, port, **kwargs)
+            return r, w
         except SOCKS5Error as e:
             raise ConnectionError('Upstream SOCKS5 proxy returned error') from e
 
@@ -1612,73 +1679,65 @@ class DetourProxy:
             assert host_entry is not None
             token = host_entry.get_detour_token()
         try:
-            r, w = await self._open_connection_detour(
+            r, w, bindaddr = await self._open_connection_detour(
                 uhost, uport, loop=self._loop, limit=self.RELAY_BUFFER_SIZE)
         except OSError as e:
-            self._logger.warning('Connecting to upstream proxy failed: %r', e)
+            self._logger.warning('Connecting to upstream proxy failed: %r',
+                                 ExceptionCausePrinter(e))
             raise
-        return r, w, token
+        return r, w, token, bindaddr
 
-    async def _client_negotiate_socks5(self, uhost, uport,
-                                       ureader: asyncio.StreamReader,
-                                       uwriter: asyncio.StreamWriter):
-        self._logger.debug('Making upstream SOCKS5 connection to (%r, %r)',
-                           uhost, uport)
+    async def _make_connection(self, connection, host_entry,
+                               host, port, log_name):
+        conn_type, need_token = connection
+        self._logger.info('%s try %s', log_name, conn_type)
+        connector = self._connector_table[conn_type]
         try:
-            uwriter.write(b'\x05\x01' + SOCKS5AuthType.NO_AUTH)
-            buf = await ureader.readexactly(2)
-            if buf[0:1] != b'\x05':
-                raise ValueError('Invalid upstream SOCKS5 auth reply')
-            if buf[1:2] != SOCKS5AuthType.NO_AUTH:
-                raise ValueError('Invalid upstream SOCKS5 auth type')
-            if isinstance(uhost, ipaddress.IPv4Address):
-                addr = SOCKS5AddressType.IPV4_ADDRESS + uhost.packed
-            elif isinstance(uhost, ipaddress.IPv6Address):
-                addr = SOCKS5AddressType.IPV6_ADDRESS + uhost.packed
-            else:
-                addr = uhost.encode('idna')
-                addr = (SOCKS5AddressType.DOMAIN_NAME
-                        + len(addr).to_bytes(1, 'big') + addr)
-            uwriter.write(b'\x05' + SOCKS5Command.CONNECT + b'\x00'
-                          + addr + uport.to_bytes(2, 'big'))
-            buf = await ureader.readexactly(4)
-            if buf[0:1] != b'\x05' or buf[2:3] != b'\x00':
-                raise ConnectionError(
-                    'Invalid upstream SOCKS5 command response %r' % buf)
-            reply = SOCKS5Reply(buf[1:2])
-            if reply is not SOCKS5Reply.SUCCESS:
-                raise SOCKS5Error(
-                    reply, 'Upstream SOCKS5 server returned error %r' % reply)
-            addr_type = SOCKS5AddressType(buf[3:4])
-            if addr_type is SOCKS5AddressType.IPV4_ADDRESS:
-                await ureader.readexactly(4 + 2)
-            elif addr_type is SOCKS5AddressType.IPV6_ADDRESS:
-                await ureader.readexactly(16 + 2)
-            elif addr_type is SOCKS5AddressType.DOMAIN_NAME:
-                buf = await ureader.readexactly(1)
-                await ureader.readexactly(buf[0] + 2)
-            self._logger.debug(
-                'Upstream SOCKS5 connection to (%r, %r) successful',
-                uhost, uport)
-        except (ValueError, OSError, EOFError) as e:
-            raise ConnectionError('Upstream SOCKS5 connection error') from e
+            result = await connector(host, port, host_entry, need_token)
+        except (OSError, EOFError, SOCKS5Error) as e:
+            self._logger.info('%s %s error during connect: %r', log_name,
+                              conn_type, ExceptionCausePrinter(e))
+            raise
+        self._logger.info('%s connection %s successful', log_name, conn_type)
+        return result
 
-    async def _server_negotiate_socks5(self, initial_byte,
-                                       dreader: asyncio.StreamReader,
-                                       dwriter: asyncio.StreamWriter):
-        assert initial_byte == b'\x05'
+    async def _make_best_connection(self, host, port, log_name) -> \
+            Tuple[Union[None, SuccessfulConnection],
+                  Dict[ConnectionType, Exception]]:
+        connections, host_entry = self._whitelist.match_host(host)
+        self._logger.debug('%s connections: %r', log_name, connections)
+        coro_fns = [partial(self._make_connection, conn, host_entry, host, port,
+                            log_name) for conn in connections]
+        success_result, success_idx, exceptions = await staggered_race(
+            coro_fns, self.NEXT_METHOD_DELAY, loop=self._loop)
+        fail_reasons = {conn[0]: exc for conn, exc
+                        in zip(connections, exceptions) if exc is not None}
+        success_connection = None
+        if success_result is not None:
+            reader, writer, this_conn_token, bindaddr = success_result
+            bind_host = bindaddr[0]
+            with suppress(ValueError):
+                bind_host = ipaddress.ip_address(bind_host)
+            bind_port = bindaddr[1]
+            success_connection = SuccessfulConnection(
+                reader, writer, host_entry, connections[success_idx][0],
+                this_conn_token, (bind_host, bind_port))
+        return success_connection, fail_reasons
+
+    async def _socks5_downstream_negotiate(
+            self, dreader: asyncio.StreamReader, dwriter: asyncio.StreamWriter
+    ) -> Tuple[HostType, int]:
         log_name = '{!r} <=> ()'.format(
             dwriter.transport.get_extra_info('peername'))
         try:
             buf = await dreader.readexactly(1)  # number of auth methods
             buf = await dreader.readexactly(buf[0])  # offered auth methods
             if SOCKS5AuthType.NO_AUTH not in buf:
-                self._logger.info('%s did not offer "no auth", offers: %r',
-                                  log_name, buf)
                 dwriter.write(b'\x05' + SOCKS5AuthType.NO_OFFERS_ACCEPTABLE)
                 dwriter.write_eof()
                 await dwriter.drain()
-                return None, None
+                raise DownstreamNegotiationError(
+                    'Client did not offer "no auth", offers: %r' % buf)
             dwriter.write(b'\x05' + SOCKS5AuthType.NO_AUTH)
 
             # client command
@@ -1686,61 +1745,61 @@ class DetourProxy:
             if buf[0] != 5 or buf[2] != 0:
                 raise DownstreamNegotiationError('%s malformed SOCKS5 command'
                                                  % log_name)
-            cmd = buf[1:2]
-            addr_type = buf[3:4]
-            if addr_type == SOCKS5AddressType.IPV4_ADDRESS:
+            cmd = SOCKS5Command(buf[1:2])
+            addr_type = SOCKS5AddressType(buf[3:4])
+            if addr_type is SOCKS5AddressType.IPV4_ADDRESS:
                 uhost = ipaddress.IPv4Address(await dreader.readexactly(4))
-            elif addr_type == SOCKS5AddressType.IPV6_ADDRESS:
+            elif addr_type is SOCKS5AddressType.IPV6_ADDRESS:
                 uhost = ipaddress.IPv6Address(await dreader.readexactly(16))
-            elif addr_type == SOCKS5AddressType.DOMAIN_NAME:
+            elif addr_type is SOCKS5AddressType.DOMAIN_NAME:
                 buf = await dreader.readexactly(1)  # address len
                 uhost = (await dreader.readexactly(buf[0])).decode('utf-8')
-                with suppress(ValueError):
+                try:
                     uhost = ipaddress.ip_address(uhost)
+                except ValueError:
+                    pass
+                else:
+                    self._logger.info(
+                        '%s client sending IP address literal as host name: %r',
+                        log_name, uhost)
             else:
-                raise DownstreamNegotiationError(
-                    '%s illegal address type' % log_name)
+                raise ValueError('%s unsupported address type %r'
+                                 % (log_name, addr_type))
             uport = int.from_bytes(await dreader.readexactly(2), 'big')
             log_name = '{!r} <=> ({!r}, {!r})'.format(
                 dwriter.transport.get_extra_info('peername'),
                 uhost, uport)
             self._logger.debug('%s parsed target address', log_name)
-            if cmd != SOCKS5Command.CONNECT:
-                self._logger.info('%s command %r not supported',
-                                  log_name, cmd)
-                await self._server_reply_socks5(
+            if cmd is not SOCKS5Command.CONNECT:
+                await self._socks5_downstream_reply(
                     dwriter, SOCKS5Reply.COMMAND_NOT_SUPPORTED, INADDR_ANY, 0)
-                return None, None
+                raise DownstreamNegotiationError(
+                    'Client command %r not supported' % cmd)
             self._logger.info('%s received CONNECT command', log_name)
             if self._ipv6_only:
-                if addr_type == SOCKS5AddressType.IPV4_ADDRESS:
-                    self._logger.info('%s cannot connect to IPv4 address '
-                                      'while IPV6_ONLY set', log_name)
-                    await self._server_reply_socks5(
+                if addr_type is SOCKS5AddressType.IPV4_ADDRESS:
+                    await self._socks5_downstream_reply(
                         dwriter, SOCKS5Reply.ADDRESS_TYPE_NOT_SUPPORTED,
                         INADDR_ANY, 0)
-                    return None, None
+                    raise DownstreamNegotiationError(
+                        'Client request connection to IPv4 address '
+                        'while IPV6_ONLY set')
             elif self._ipv4_only:
-                if addr_type == SOCKS5AddressType.IPV6_ADDRESS:
-                    self._logger.info('%s cannot connect to IPv6 address '
-                                      'while IPV4_ONLY set', log_name)
-                    await self._server_reply_socks5(
+                if addr_type is SOCKS5AddressType.IPV6_ADDRESS:
+                    await self._socks5_downstream_reply(
                         dwriter, SOCKS5Reply.ADDRESS_TYPE_NOT_SUPPORTED,
                         INADDR_ANY, 0)
-                    return None, None
+                    raise DownstreamNegotiationError(
+                        'Client request connection to IPv6 address '
+                        'while IPV4_ONLY set')
             return uhost, uport
-        except (OSError, EOFError) as e:
-            raise DownstreamNegotiationError from e
+        except (OSError, EOFError, ValueError) as e:
+            raise DownstreamNegotiationError(
+                'Error while negotiating with SOCKS5 client') from e
 
-    async def _server_reply_socks5(self, dwriter: asyncio.StreamWriter,
-                                   reply=None, host=None, port=None):
-        if reply is None:
-            reply = SOCKS5Reply.SUCCESS
+    async def _socks5_downstream_reply(self, dwriter: asyncio.StreamWriter,
+                                       reply, host, port):
         assert len(reply) == 1
-        if host is None:
-            host = INADDR_ANY
-        if port is None:
-            port = 0
         if isinstance(host, ipaddress.IPv4Address):
             b_addr = SOCKS5AddressType.IPV4_ADDRESS + host.packed
         elif isinstance(host, ipaddress.IPv6Address):
@@ -1756,15 +1815,148 @@ class DetourProxy:
                 dwriter.write_eof()
             await dwriter.drain()
         except OSError as e:
-            raise DownstreamNegotiationError from e
+            raise DownstreamNegotiationError(
+                'Error while replying to SOCKS5 client') from e
 
-    async def _server_reply_http_stub(self, initial_byte,
-                                      dreader: asyncio.StreamReader,
-                                      dwriter: asyncio.StreamWriter):
+    def _map_exception_to_socks5_reply(self, exc):
+        if isinstance(exc, SOCKS5Error):
+            return exc.args[0]
+        if isinstance(exc, socket.gaierror):
+            return SOCKS5Reply.HOST_UNREACHABLE
+        if isinstance(exc, TimeoutError):
+            return SOCKS5Reply.TTL_EXPIRED
+        if isinstance(exc, ConnectionRefusedError):
+            return SOCKS5Reply.CONNECTION_REFUSED
+        if isinstance(exc, OSError):
+            if exc.errno == errno.ENETUNREACH:
+                return SOCKS5Reply.NETWORK_UNREACHABLE
+            elif exc.errno == errno.EHOSTUNREACH:
+                return SOCKS5Reply.HOST_UNREACHABLE
+            elif exc.errno == errno.ECONNREFUSED:
+                return SOCKS5Reply.CONNECTION_REFUSED
+            elif exc.errno == errno.ETIMEDOUT:
+                return SOCKS5Reply.TTL_EXPIRED
+            elif WINDOWS and exc.winerror == 121:
+                # OSError: [WinError 121] The semaphore timeout period has
+                # expired
+                # Looks like this exception instead of TimeoutError is raised
+                # by ProactorEventLoop
+                return SOCKS5Reply.TTL_EXPIRED
+        if isinstance(exc, ConnectionError):
+            return SOCKS5Reply.GENERAL_FAILURE
+        self._logger.warning('Unexpected exception', exc_info=exc)
+        return SOCKS5Reply.GENERAL_FAILURE
+
+    async def _server_handle_socks5(
+            self, initial_byte: bytes, stack: ExitStack,
+            dreader: asyncio.StreamReader, dwriter: asyncio.StreamWriter,
+    ) -> Tuple[SuccessfulConnection, HostType, int]:
+        assert initial_byte == b'\x05'
+        uhost, uport = await self._socks5_downstream_negotiate(dreader, dwriter)
+        log_name = '{!r} <=> ({!r}, {!r})'.format(
+            dwriter.transport.get_extra_info('peername'),
+            uhost, uport)
+        conn, fail_reasons = await self._make_best_connection(
+            uhost, uport, log_name)
+        if conn is None:
+            socks5_reply_counter = Counter(
+                self._map_exception_to_socks5_reply(e)
+                for e in fail_reasons.values())
+            socks5_reply_counter.pop(SOCKS5Reply.GENERAL_FAILURE, None)
+            if socks5_reply_counter:
+                reply = socks5_reply_counter.most_common(1)[0][0]
+            else:
+                reply = SOCKS5Reply.GENERAL_FAILURE
+            await self._socks5_downstream_reply(dwriter, reply,
+                                                INADDR_ANY, 0)
+            raise UpstreamConnectionError(
+                'All connection attempts to ({!r}, {!r}) failed'.format(
+                    uhost, uport))
+        uwriter = conn.writer
+        stack.enter_context(finally_close(uwriter))
+        if not SOCKS5_RETURN_FAKE_BIND_ADDR:
+            bind_host, bind_port = conn.bindaddr
+        else:
+            bind_host = INADDR_ANY
+            bind_port = 0
+        await self._socks5_downstream_reply(dwriter, SOCKS5Reply.SUCCESS,
+                                            bind_host, bind_port)
+        return conn, uhost, uport
+
+    async def _socks4_downstream_negotiate(
+            self, dreader: asyncio.StreamReader, dwriter: asyncio.StreamWriter
+    ) -> Tuple[HostType, int]:
         log_name = '{!r} <=> ()'.format(
             dwriter.transport.get_extra_info('peername'))
-        self._logger.info('%s Received HTTP request, replying with stub',
-                          log_name)
+        try:
+            command = SOCKS4Command(await dreader.readexactly(1))
+            if command is not SOCKS4Command.CONNECT:
+                await self._socks4_downstream_reply(dwriter, False)
+                raise DownstreamNegotiationError(
+                    'Client command %r not supported' % command)
+            self._logger.debug('%s received SOCKS4 CONNECT command', log_name)
+            uport = int.from_bytes(await dreader.readexactly(2), 'big')
+            uip = ipaddress.IPv4Address(await dreader.readexactly(4))
+            userid = await dreader.readuntil(b'\0')
+            if uip in SOCKS4A_INVALID_IP:
+                self._logger.debug('%s request is SOCKS4A')
+                uhost = await dreader.readuntil(b'\0')[:-1]
+                try:
+                    uhost = ipaddress.ip_address(uhost)
+                except ValueError:
+                    pass
+                else:
+                    self._logger.info(
+                        '%s client sending IP address literal as host name: %r',
+                        log_name, uhost)
+            else:
+                uhost = uip
+            log_name = '{!r} <=> ({!r}, {!r})'.format(
+                dwriter.transport.get_extra_info('peername'),
+                uhost, uport)
+            self._logger.debug('%s parsed target address', log_name)
+            return uhost, uport
+        except (OSError, EOFError, ValueError, asyncio.LimitOverrunError) as e:
+            raise DownstreamNegotiationError(
+                'Error while negotiating with SOCKS4 client') from e
+
+    async def _socks4_downstream_reply(self, dwriter: asyncio.StreamWriter,
+                                       success: bool):
+        try:
+            if success:
+                dwriter.write(b'\0' + SOCKS4Reply.GRANTED + b'\0\0\0\0\0\0')
+            else:
+                dwriter.write(b'\0' + SOCKS4Reply.REJECTED_FAILED
+                              + b'\0\0\0\0\0\0')
+                dwriter.write_eof()
+            await dwriter.drain()
+        except (OSError, EOFError) as e:
+            raise DownstreamNegotiationError(
+                'Error while replying to SOCKS4 client') from e
+
+    async def _server_handle_socks4(
+            self, initial_byte: bytes, stack: ExitStack,
+            dreader: asyncio.StreamReader, dwriter: asyncio.StreamWriter,
+    ) -> Tuple[SuccessfulConnection, HostType, int]:
+        assert initial_byte == b'\x04'
+        uhost, uport = await self._socks4_downstream_negotiate(dreader, dwriter)
+        log_name = '{!r} <=> ({!r}, {!r})'.format(
+            dwriter.transport.get_extra_info('peername'),
+            uhost, uport)
+        conn, fail_reasons = await self._make_best_connection(
+            uhost, uport, log_name)
+        if conn is None:
+            await self._socks4_downstream_reply(dwriter, False)
+            raise UpstreamConnectionError(
+                'All connection attempts to ({!r}, {!r}) failed'.format(
+                    uhost, uport))
+        stack.enter_context(finally_close(conn.writer))
+        await self._socks4_downstream_reply(dwriter, True)
+        return conn, uhost, uport
+
+    async def _server_handle_http(self, initial_byte, stack,
+                                  dreader: asyncio.StreamReader,
+                                  dwriter: asyncio.StreamWriter):
         body = b'''<!doctype html>
 <html lang=en>
 <head>
@@ -1788,142 +1980,10 @@ DetourProxy as a SOCKS5 proxy instead.
             dwriter.write(response)
             dwriter.write_eof()
             await dwriter.drain()
-            return None, None
+            raise DownstreamNegotiationError('Client sent HTTP request')
         except OSError as e:
-            raise DownstreamNegotiationError from e
-
-    async def _make_connection(self, connection, host_entry,
-                               host, port, log_name):
-        conn_type, need_token = connection
-        self._logger.info('%s try %s', log_name, conn_type)
-        connector = self._connector_table[conn_type]
-        try:
-            result = await connector(host, port, host_entry, need_token)
-        except (OSError, EOFError, SOCKS5Error) as e:
-            self._logger.info('%s %s error during connect: <%r>', log_name,
-                              conn_type, e)
-            raise
-        self._logger.info('%s connection %s successful', log_name, conn_type)
-        return result
-
-    async def _make_best_connection(self, host, port, log_name) -> \
-            Tuple[Union[None, SuccessfulConnection],
-                  Dict[ConnectionType, Exception]]:
-        connections, host_entry = self._whitelist.match_host(host)
-        self._logger.debug('%s connections: %r', log_name, connections)
-        coro_fns = [partial(self._make_connection, conn, host_entry, host, port,
-                            log_name) for conn in connections]
-        success_result, success_idx, exceptions = await staggered_race(
-            coro_fns, self.NEXT_METHOD_DELAY, loop=self._loop)
-        fail_reasons = {conn[0]: exc for conn, exc
-                        in zip(connections, exceptions) if exc is not None}
-        success_connection = None
-        if success_result is not None:
-            reader, writer, this_conn_token = success_result
-            success_connection = SuccessfulConnection(
-                reader, writer, host_entry, connections[success_idx][0],
-                this_conn_token)
-        return success_connection, fail_reasons
-
-    @staticmethod
-    def _report_relay_result(conn: SuccessfulConnection, successful: bool):
-        if conn.host_entry is not None:
-            if successful:
-                conn.host_entry.report_relay_success(conn.conn_type, conn.token)
-            else:
-                conn.host_entry.report_relay_failure(conn.conn_type)
-
-    async def _server_handler(self, dreader: asyncio.StreamReader,
-                              dwriter: asyncio.StreamWriter):
-        log_name = '{!r} <=> ()'.format(
-            dwriter.transport.get_extra_info('peername'))
-
-        try:  # catch, log and suppress all exceptions in outermost layer
-            with ExitStack() as stack:
-                this_task = current_task()
-                self._connections.add(this_task)
-                stack.callback(self._connections.remove, this_task)
-                stack.enter_context(finally_close(dwriter))
-                self._logger.debug('%s accepted downstream connection',
-                                   log_name)
-                try:
-                    initial_byte = await dreader.readexactly(1)
-                except (OSError, EOFError) as e:
-                    raise DownstreamNegotiationError from e
-                if initial_byte == b'\x05':
-                    uhost, uport = await self._server_negotiate_socks5(
-                        initial_byte, dreader, dwriter)
-                elif b'A' <= initial_byte <= b'Z':
-                    uhost, uport = await self._server_reply_http_stub(
-                        initial_byte, dreader, dwriter)
-                else:
-                    raise DownstreamNegotiationError(
-                        '%s unknown protocol' % log_name)
-                if uhost is None or uport is None:
-                    return
-                log_name = '{!r} <=> ({!r}, {!r})'.format(
-                    dwriter.transport.get_extra_info('peername'),
-                    uhost, uport)
-
-                conn, fail_reasons = await self._make_best_connection(
-                    uhost, uport, log_name)
-                if conn is None:
-                    socks5_reply_counter = Counter(
-                        self._map_exception_to_socks5_reply(e)
-                        for e in fail_reasons.values())
-                    socks5_reply_counter.pop(SOCKS5Reply.GENERAL_FAILURE, None)
-                    if socks5_reply_counter:
-                        reply = socks5_reply_counter.most_common(1)[0][0]
-                    else:
-                        reply = SOCKS5Reply.GENERAL_FAILURE
-                    await self._server_reply_socks5(dwriter, reply,
-                                                    INADDR_ANY, 0)
-                    return
-                ureader = conn.reader
-                uwriter = conn.writer
-                stack.enter_context(finally_close(uwriter))
-                if not SOCKS5_RETURN_FAKE_BIND_ADDR:
-                    bind_host, bind_port = uwriter.transport.get_extra_info(
-                        'sockname')[:2]
-                    with suppress(ValueError):
-                        bind_host = ipaddress.ip_address(bind_host)
-                else:
-                    bind_host = INADDR_ANY
-                    bind_port = 0
-                await self._server_reply_socks5(dwriter, SOCKS5Reply.SUCCESS,
-                                                bind_host, bind_port)
-                log_name = '{!r} <=> ({!r}, {!r}) [{}]'.format(
-                    dwriter.transport.get_extra_info('peername'),
-                    uhost, uport, conn.conn_type)
-
-                try:
-                    await self._relay_data(dreader, dwriter,
-                                           ureader, uwriter,
-                                           (uhost, uport))
-                except UpstreamRelayError as e:
-                    self._logger.info(
-                        '%s upstream relay error: %r',
-                        log_name, ExceptionCausePrinter(e))
-                    self._report_relay_result(conn, False)
-                    return
-                self._logger.info('%s completed normally',
-                                  log_name)
-                self._report_relay_result(conn, True)
-                return
-        except asyncio.CancelledError:
-            self._logger.debug('%s cancelled', log_name)
-            raise
-        except (UpstreamRelayError,
-                RelayError,
-                DownstreamNegotiationError,
-                ) as e:
-            # not logging stack trace for expected errors
-            self._logger.info('%s Exception: %r',
-                              log_name, ExceptionCausePrinter(e))
-        except Exception as e:
-            self._logger.error('%s %r', log_name, e, exc_info=True)
-        finally:
-            self._logger.debug('%s connection done', log_name)
+            raise DownstreamNegotiationError(
+                'Error while replying to HTTP client') from e
 
     async def _relay_data_side(self, reader, writer,
                                log_name, write_is_upstream):
@@ -1934,7 +1994,8 @@ DetourProxy as a SOCKS5 proxy instead.
                     buf = await reader.read(self.RELAY_BUFFER_SIZE)
                 except OSError as e:
                     if not write_is_upstream:
-                        raise UpstreamRelayError from e
+                        raise UpstreamRelayError(
+                            'Error receiving from upstream') from e
                     else:
                         raise
                 if not buf:  # EOF
@@ -1945,7 +2006,8 @@ DetourProxy as a SOCKS5 proxy instead.
                     await writer.drain()
                 except OSError as e:
                     if write_is_upstream:
-                        raise UpstreamRelayError from e
+                        raise UpstreamRelayError(
+                            'Error sending to upstream') from e
                     else:
                         raise
                 self._logger.debug('%s sent data', log_name)
@@ -1956,7 +2018,8 @@ DetourProxy as a SOCKS5 proxy instead.
                 await writer.drain()
             except OSError as e:
                 if write_is_upstream:
-                    raise UpstreamRelayError from e
+                    raise UpstreamRelayError(
+                        'Error writing EOF to upstream') from e
                 else:
                     raise
             self._logger.debug('%s wrote EOF', log_name)
@@ -1992,19 +2055,77 @@ DetourProxy as a SOCKS5 proxy instead.
             utask.cancel()
             raise
 
-    async def stop(self):
-        """Terminate the server and all active connections."""
-        if self._server is None:
-            raise RuntimeError('DetourProxy is not running')
-        self._logger.info('DetourProxy closing')
-        wait_list = []
-        self._server.close()
-        wait_list.append(self._server.wait_closed())
-        for conn in self._connections:
-            conn.cancel()
-            wait_list.append(conn)
-        # wait_list.extend(self._connections)
-        await asyncio.gather(*wait_list, return_exceptions=True)
+    @staticmethod
+    def _report_relay_result(conn: SuccessfulConnection, successful: bool):
+        if conn.host_entry is not None:
+            if successful:
+                conn.host_entry.report_relay_success(conn.conn_type, conn.token)
+            else:
+                conn.host_entry.report_relay_failure(conn.conn_type)
+
+    async def _server_handler(self, dreader: asyncio.StreamReader,
+                              dwriter: asyncio.StreamWriter):
+        log_name = '{!r} <=> ()'.format(
+            dwriter.transport.get_extra_info('peername'))
+
+        try:  # catch, log and suppress all exceptions in outermost layer
+            with ExitStack() as stack:
+                this_task = current_task()
+                self._connections.add(this_task)
+                stack.callback(self._connections.remove, this_task)
+                stack.enter_context(finally_close(dwriter))
+                self._logger.debug('%s accepted downstream connection',
+                                   log_name)
+                try:
+                    initial_byte = await dreader.readexactly(1)
+                except (OSError, EOFError) as e:
+                    raise DownstreamNegotiationError(
+                        'Error reading from client') from e
+                if initial_byte == b'\x05':
+                    conn, uhost, uport = await self._server_handle_socks5(
+                        initial_byte, stack, dreader, dwriter)
+                elif initial_byte == b'\x04':
+                    conn, uhost, uport = await self._server_handle_socks4(
+                        initial_byte, stack, dreader, dwriter)
+                elif b'A' <= initial_byte <= b'Z':
+                    conn, uhost, uport = await self._server_handle_http(
+                        initial_byte, stack, dreader, dwriter)
+                else:
+                    raise DownstreamNegotiationError(
+                        '%s unknown protocol' % log_name)
+
+                ureader = conn.reader
+                uwriter = conn.writer
+
+                log_name = '{!r} <=> ({!r}, {!r}) [{}]'.format(
+                    dwriter.transport.get_extra_info('peername'),
+                    uhost, uport, conn.conn_type)
+
+                try:
+                    await self._relay_data(dreader, dwriter,
+                                           ureader, uwriter,
+                                           (uhost, uport))
+                except UpstreamRelayError:
+                    self._report_relay_result(conn, False)
+                    raise
+                self._logger.info('%s completed normally',
+                                  log_name)
+                self._report_relay_result(conn, True)
+                return
+        except asyncio.CancelledError:
+            self._logger.debug('%s cancelled', log_name)
+            raise
+        except (UpstreamConnectionError,
+                DownstreamNegotiationError,
+                RelayError,
+                ) as e:
+            # not logging stack trace for expected errors
+            self._logger.info('%s Exception: %r',
+                              log_name, ExceptionCausePrinter(e))
+        except Exception as e:
+            self._logger.error('%s %r', log_name, e, exc_info=True)
+        finally:
+            self._logger.debug('%s connection done', log_name)
 
 
 def windows_async_signal_helper(loop, interval=0.2):
@@ -2016,7 +2137,8 @@ def windows_async_signal_helper(loop, interval=0.2):
     is happening. A regular callback allows such signals to be
     delivered.
     """
-    noop_callback(loop, interval)
+    if WINDOWS:
+        noop_callback(loop, interval)
 
 
 def noop_callback(loop, delay):
@@ -2107,7 +2229,9 @@ def relay():
                 or args.dns_detour):
             sys.exit('Arguments error: --dns is not set. To use built-in '
                      'settings, do not set ANY of the --dns[-*] options.')
-        args.dns = '1.1.1.1'
+        # Use a domain name here for the DNS server, so the upstream proxy is
+        # free to decide whether to use IPv4 or IPv6.
+        args.dns = '1dot1dot1dot1.cloudflare-dns.com'
         args.dns_tcp = True
         args.dns_detour = True
 
@@ -2198,8 +2322,7 @@ def relay():
     else:
         logging.info('DNS poison IP list loaded')
 
-    if WINDOWS:
-        windows_async_signal_helper(loop)
+    windows_async_signal_helper(loop)
     with suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
 

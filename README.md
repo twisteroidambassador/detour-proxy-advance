@@ -55,11 +55,13 @@ By default, the script reads and writes several files in the working directory. 
 - `persistent.txt` contains host names / IP addresses that should always use a certain connection method. See the provided file for examples and comments.
 - `state.csv` stores information learned about censored sites.
 
-Run the script with the appropriate arguments, set your browser to use a SOCKS5 proxy at 127.0.0.1:1080 or whatever address:port specified using `--bind` and `--bind-port` arguments, and browse away.
+Run the script with the appropriate arguments, set your browser to use a SOCKS5 / SOCKS4A proxy at 127.0.0.1:1080 or whatever address:port specified using `--bind` and `--bind-port` arguments, and browse away.
+
+Note: the client software must be configured to send the host name to the proxy, instead of resolving the host name and sending the IP address to the proxy. For example, in Firefox, "Proxy DNS when using SOCKS v5" must be turned on. If in doubt, turn on "`--verbose`" and observe the logging output.
 
 ### If a convenient uncensored DNS server is not available
 
-The script is now able to use a DNS server through the upstream proxy natively, without 3rd-party tools. If none of the DNS-related command line arguments are specified, the script will use the configured upstream proxy to reach CloudFlare's public DNS service (1.1.1.1) and use that. With DNS TCP pipelining, the overhead should be minimized.
+The script is now able to use a DNS server through the upstream proxy natively, without 3rd-party tools. If none of the DNS-related command line arguments are specified, the script will use the configured upstream proxy to reach CloudFlare's public DNS service (1dot1dot1dot1.cloudflare-dns.com, more commonly known as 1.1.1.1) and use that. With DNS TCP pipelining, the overhead should be minimized.
 
 ## Future plans
 

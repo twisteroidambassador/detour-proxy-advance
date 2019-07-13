@@ -865,6 +865,9 @@ class ResolverCache:
         finally:
             if self._cache[key] is fut:
                 del self._cache[key]
+            # Consume fut's exception to avoid "Future exception was never retrieved"
+            with suppress(asyncio.CancelledError):
+                fut.exception()
 
     async def get_cache_or_query(self, key, query_coro, *args):
         """Retrieve answer for key if cached, else retrieve using query_coro.

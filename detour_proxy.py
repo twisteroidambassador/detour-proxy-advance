@@ -847,6 +847,25 @@ class ResolverCache:
         if self._last_pruned + self._prune_interval < self._loop.time():
             self._prune()
 
+    async def _query_then_cache(self, fut, key, query_coro, *args):
+        assert self._cache[key] is fut
+        try:
+            answer, ttl = await query_coro(*args)
+            self._logger.debug('Got answer %r with ttl %r', answer, ttl)
+            fut.set_result(answer)
+            if self._max_ttl is not None:
+                ttl = min(ttl, self._max_ttl)
+            if ttl > 0:
+                self._logger.debug('answer for %r saved in cache for ttl %r', key, ttl)
+                self._cache[key] = CacheEntry(answer, self._loop.time() + ttl)
+        except asyncio.CancelledError:
+            fut.set_exception(socket.gaierror(socket.EAI_AGAIN, 'DNS query was cancelled'))
+        except Exception as e:
+            fut.set_exception(e)
+        finally:
+            if self._cache[key] is fut:
+                del self._cache[key]
+
     async def get_cache_or_query(self, key, query_coro, *args):
         """Retrieve answer for key if cached, else retrieve using query_coro.
 
@@ -863,32 +882,18 @@ class ResolverCache:
             if not isinstance(cache_entry, CacheEntry):
                 # cache_entry is a future
                 self._logger.debug('query for %r ongoing, awaiting result', key)
-                return await cache_entry
+                return await asyncio.shield(cache_entry)
             if cache_entry.expiry > self._loop.time():
                 self._logger.debug('cached answer for %r valid', key)
                 return cache_entry.answer
             del self._cache[key]
-            self._logger.debug('cached answer for %r stale, deleting', key)
+            self._logger.debug('deleted stale cached answer for %r', key)
 
         self._logger.debug('no cached answer for %r, querying', key)
         answer_fut = asyncio.Future()
         self._cache[key] = answer_fut
-        try:
-            answer, ttl = await query_coro(*args)
-            self._logger.debug('Got answer %r with ttl %r', answer, ttl)
-            answer_fut.set_result(answer)
-            if self._max_ttl is not None:
-                ttl = min(ttl, self._max_ttl)
-            if ttl > 0:
-                self._logger.debug('answer for %r saved in cache', key)
-                self._cache[key] = CacheEntry(answer, self._loop.time() + ttl)
-            return answer
-        except Exception as e:
-            answer_fut.set_exception(e)
-            raise
-        finally:
-            if self._cache[key] is answer_fut:
-                del self._cache[key]
+        self._loop.create_task(self._query_then_cache(answer_fut, key, query_coro, *args))
+        return await asyncio.shield(answer_fut)
 
 
 class Resolver:
@@ -918,8 +923,8 @@ class Resolver:
         else:
             raise ValueError('ip_version must be 4 or 6')
         try:
-            return await asyncio.shield(cache.get_cache_or_query(
-                key, self._querier.query, key, ip_version), loop=self._loop)
+            return await cache.get_cache_or_query(
+                key, self._querier.query, key, ip_version)
         except socket.gaierror:
             raise
         except (OSError, EOFError) as e:

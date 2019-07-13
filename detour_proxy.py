@@ -974,7 +974,7 @@ class Resolver:
                     (socket.AF_INET6, socket.SOCK_STREAM, 0, '', (addr, port))
                     for addr in ipv6_result]
             if exception_count >= 2:
-                raise socket.gaierror('Both IPv4 and IPv6 resolution failed')
+                raise socket.gaierror(socket.EAI_NODATA, 'Both IPv4 and IPv6 resolution failed')
             if self._ipv6_first:
                 return list(roundrobin(ipv6_addrinfo, ipv4_addrinfo))
             else:
@@ -1055,7 +1055,7 @@ class BaseQuerier:
                     assert min_ttl != float('inf')
                     return addresses, min_ttl
         elif response.rcode() != dns.rcode.NXDOMAIN:
-            raise socket.gaierror('DNS response has RCODE {}'.format(
+            raise socket.gaierror(socket.EAI_FAIL, 'DNS response has RCODE {}'.format(
                 dns.rcode.to_text(response.rcode())))
         # either NXDOMAIN or NODATA: check SOA record for ttl
         current_name = qname
@@ -1224,7 +1224,7 @@ class TCPQuerier(BaseQuerier):
                 if writer is not None:
                     writer.close()
         else:
-            raise socket.gaierror('DNS resolution all retries failed')
+            raise socket.gaierror(socket.EAI_AGAIN, 'DNS resolution all retries failed')
 
 
 class TCPPipeliningQuerier(BaseQuerier):
@@ -1402,7 +1402,7 @@ class TCPPipeliningQuerier(BaseQuerier):
                 last_exception = e
                 continue
         else:
-            raise socket.gaierror('All retries failed') from last_exception
+            raise socket.gaierror(socket.EAI_AGAIN, 'All retries failed') from last_exception
 
         return self._parse_response(response)
 

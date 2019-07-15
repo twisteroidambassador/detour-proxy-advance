@@ -49,8 +49,9 @@ import dns.rdatatype
 DEFAULT_DNS_POISON_FILE = os.path.join(
     os.path.dirname(__file__), 'dns_poison_list.txt')
 
-# Use ProactorEventLoop instead of SelectorEventLoop if (1) we're running on
-# Windows, and (2) not using UDP for DNS. ProactorEventLoop is supposed to have
+# If the current event loop policy is WindowsSelectorEventLoopPolicy, and we're
+# not using UDP for DNS, switch to WindowsProactorEventLoopPolicy.
+# ProactorEventLoop is supposed to have
 # better performance, but it seems to be more buggy as well.
 WINDOWS_USE_PROACTOR_EVENT_LOOP = True
 
@@ -2276,10 +2277,10 @@ def relay():
     if (WINDOWS_USE_PROACTOR_EVENT_LOOP
             and WINDOWS
             and (args.dns_tcp or args.dns_tcp_lame)):
-        loop = asyncio.ProactorEventLoop()
-        asyncio.set_event_loop(loop)
-    else:
-        loop = asyncio.get_event_loop()
+        policy = asyncio.get_event_loop_policy()
+        if isinstance(policy, asyncio.WindowsSelectorEventLoopPolicy):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy)
+    loop = asyncio.get_event_loop()
     # loop.set_debug(True)
 
     whitelist = DetourTokenWhitelist()

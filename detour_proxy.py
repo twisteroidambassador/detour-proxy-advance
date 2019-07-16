@@ -1233,8 +1233,7 @@ class TCPQuerier(BaseQuerier):
 class TCPPipeliningQuerier(BaseQuerier):
     """DNS querier over TCP, using pipelining.
 
-    Multiple requests are sent over the same TCP connection. Uses the
-    edns-tcp-keepalive option.
+    Implements RFC 7766 and RFC 7828.
     """
     receive_timeout = 30
     query_retries = 3
@@ -1494,7 +1493,10 @@ class DetourProxy:
             raise
 
     async def _getaddrinfo_native(self, host, port, family=socket.AF_UNSPEC):
-        """Happy Eyeballs-appropriate getaddrinfo(). Reorders addresses."""
+        """Lookup addresses, then reorder them Happy Eyeballs-style.
+
+        Implements address sorting as specified in RFC 8305.
+        """
         addrinfos = await self._loop.getaddrinfo(
             host, port, family=family, type=socket.SOCK_STREAM)
         if family == socket.AF_UNSPEC:
@@ -1509,6 +1511,10 @@ class DetourProxy:
         return addrinfos
 
     async def _open_connections_parallel(self, addrinfo_list, delay=None):
+        """Connect to an upstream address Happy Eyeballs-style.
+
+        Implements connection attempts as specified in RFC 8305.
+        """
         if delay is None:
             delay = self.NEXT_SOCKET_DELAY
         self._logger.debug('Attempting to connect to one of: %r', addrinfo_list)

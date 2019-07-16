@@ -1317,7 +1317,7 @@ class TCPPipeliningQuerier(BaseQuerier):
                     self._logger.debug('Received DNS message:\n%s', response)
                     if response.edns == 0:
                         for option in response.options:
-                            if option.otype == 11:
+                            if option.otype == dns.edns.KEEPALIVE:
                                 # TIMEOUT is in units of 100 milliseconds
                                 this_conn_idle_timeout = int.from_bytes(
                                     option.data, 'big') / 10
@@ -1392,7 +1392,7 @@ class TCPPipeliningQuerier(BaseQuerier):
         if request is None:
             request = self._make_query(qname, ip_version)
         # RFC 7828: edns-tcp-keepalive
-        edns_tcp_keepalive = dns.edns.GenericOption(11, b'')
+        edns_tcp_keepalive = dns.edns.GenericOption(dns.edns.KEEPALIVE, b'')
         request.use_edns(0, options=[edns_tcp_keepalive])
         # The two following options are SHOULD in RFC 8310
         # RFC 7871: privacy election for client subnet

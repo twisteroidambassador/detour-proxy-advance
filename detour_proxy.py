@@ -1240,11 +1240,14 @@ class TCPPipeliningQuerier(BaseQuerier):
     query_retry_interval = 0
 
     def __init__(self, server, port=53, connect_coro=asyncio.open_connection,
-                 idle_timeout=5, loop=None):
+                 idle_timeout=5, client_subnet_privacy=False,
+                 pad_to_multiple_of=None, loop=None):
         self._server = server
         self._port = port
         self.connector = connect_coro
         self.idle_timeout = idle_timeout
+        self._client_subnet_privacy = client_subnet_privacy
+        self._pad_to_multiple_of = pad_to_multiple_of
         self._loop = loop or asyncio.get_event_loop()
 
         self._logger = logging.getLogger('detour.dns.tcp-pl')
@@ -1391,6 +1394,16 @@ class TCPPipeliningQuerier(BaseQuerier):
         # RFC 7828: edns-tcp-keepalive
         edns_tcp_keepalive = dns.edns.GenericOption(11, b'')
         request.use_edns(0, options=[edns_tcp_keepalive])
+        # The two following options are SHOULD in RFC 8310
+        # RFC 7871: privacy election for client subnet
+        if self._client_subnet_privacy:
+            request.options.append(dns.edns.ECSOption('0.0.0.0', 0))
+        # RFC 8467: block-length padding strategy
+        if self._pad_to_multiple_of:
+            min_padded_len = len(request.to_wire()) + 4
+            pad_len = (-min_padded_len) % self._pad_to_multiple_of
+            request.options.append(dns.edns.GenericOption(
+                dns.edns.PADDING, bytes(pad_len)))
 
         last_exception = None
         for retry in range(self.query_retries):

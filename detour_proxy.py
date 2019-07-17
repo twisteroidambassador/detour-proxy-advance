@@ -27,6 +27,7 @@ import os.path
 import random
 import signal
 import socket
+import ssl
 import sys
 import time
 import warnings
@@ -1179,6 +1180,26 @@ class UDPQuerier(BaseQuerier):
         finally:
             response_fut.cancel()
             transport.close()
+
+
+async def stream_start_tls(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        context: ssl.SSLContext,
+        server_hostname: Optional[str],
+) -> None:
+    """Upgrade existing StreamReader/Writer pair to TLS.
+
+    This is extremely unofficial, since StreamReader/Writer does not
+    support having its transport swapped out under them. Use at your own risk.
+    """
+    loop = asyncio.get_event_loop()
+    transport = await loop.start_tls(
+        writer.transport, writer._protocol, context,
+        server_hostname=server_hostname)
+    writer._transport = transport
+    reader._transport = transport
+    writer._protocol._over_ssl = True
 
 
 class TCPQuerier(BaseQuerier):

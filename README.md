@@ -40,10 +40,10 @@ The end result is that, censored websites either work right away, or starts work
 
 The following are required to use Detour Proxy Advance:
 
-- Python 3.5 or higher.
+- Python 3.5 or higher. **Using the latest Python 3 release is STRONGLY RECOMMENDED**, since this project gets very little testing on  older Python versions.
 - The `dnspython` Python package.
 - A SOCKS5 proxy server that can reach censored websites. This can be anything that presents a SOCKS5 server with no user authentication: a plain proxy server, a proxy server tunneled through a VPN, `stunnel` or `obfs4proxy`, a SSH connection with dynamic forwarding, etc. (Proxies with user authentication are not supported.)
-- Optional: A DNS server that returns authentic, non-poisoned IP addresses. This can be a local DNS proxy utilizing one of the encrypted protocols (DNSCrypt, DNS over TLS, DNS over HTTPS, etc.), a DNS server across a VPN link, etc. If one is not available, Detour Proxy Advance can use the upstream SOCKS5 proxy to reach a public DNS service.
+- Optional: A DNS server that returns authentic, non-poisoned IP addresses. This can be a local DNS proxy utilizing one of the encrypted protocols (DNSCrypt, DNS over TLS, DNS over HTTPS, etc.), a DNS server across a VPN link, a DNS server that supports TLS, etc. Detour Proxy Advance can also use the upstream SOCKS5 proxy to reach a public DNS service.
 
 ### Configuration and usage
 
@@ -61,11 +61,11 @@ Note: the client software must be configured to send the host name to the proxy,
 
 ### If a convenient uncensored DNS server is not available
 
-The script is now able to use a DNS server through the upstream proxy natively, without 3rd-party tools. If none of the DNS-related command line arguments are specified, the script will use the configured upstream proxy to reach CloudFlare's public DNS service (1dot1dot1dot1.cloudflare-dns.com, more commonly known as 1.1.1.1) and use that. With DNS TCP pipelining, the overhead should be minimized.
+The script supports DNS over TLS, and can also use a DNS server through the upstream proxy. If the `--dns` argument is not specified, the script will use CloudFlare's public DNS service over TLS (1dot1dot1dot1.cloudflare-dns.com, more commonly known as 1.1.1.1). This can be combined with `--dns-detour` to tunnel the DNS connection through the upstream SOCKS proxy. With DNS TCP pipelining, the overhead should be minimized.
 
 ## Future plans
 
-DNS over TLS might be a good feature to implement, but 1) DNS over TLS through proxy won't be possible until asyncio adds STARTTLS and 2) there's no way to do SPKI fingerprint verification without bringing in another dependency.
+DNS over TLS is now implemented! I'll have to think of some other Todo item here.
 
 ### Features that will not be added
 

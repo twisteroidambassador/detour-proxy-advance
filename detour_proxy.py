@@ -27,8 +27,10 @@ import os.path
 import random
 import signal
 import socket
+import ssl
 import sys
 import time
+import urllib.parse
 import warnings
 from collections import defaultdict, Counter, namedtuple, OrderedDict
 from contextlib import ExitStack, contextmanager, suppress
@@ -1145,7 +1147,8 @@ class UDPQuerier(BaseQuerier):
 
         self._logger = logging.getLogger('detour.dns.udp')
         self._fallback_querier = TCPQuerier(
-            self._server, self._port, loop=self._loop)
+            partial(asyncio.open_connection, self._server, self._port),
+            loop=self._loop)
 
     async def query(self, qname=None, ip_version=4,
                     request: dns.message.Message = None):
@@ -1182,6 +1185,26 @@ class UDPQuerier(BaseQuerier):
             transport.close()
 
 
+async def stream_start_tls(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        context: ssl.SSLContext,
+        server_hostname: Optional[str],
+) -> None:
+    """Upgrade existing StreamReader/Writer pair to TLS.
+
+    This is extremely unofficial, since StreamReader/Writer does not
+    support having its transport swapped out under them. Use at your own risk.
+    """
+    loop = asyncio.get_event_loop()
+    transport = await loop.start_tls(
+        writer.transport, writer._protocol, context,
+        server_hostname=server_hostname)
+    writer._transport = transport
+    reader._transport = transport
+    writer._protocol._over_ssl = True
+
+
 class TCPQuerier(BaseQuerier):
     """DNS querier over TCP.
 
@@ -1190,10 +1213,7 @@ class TCPQuerier(BaseQuerier):
     query_retries = 3
     query_retry_interval = 1
 
-    def __init__(self, server, port=53, connect_coro=asyncio.open_connection,
-                 loop=None):
-        self._server = server
-        self._port = port
+    def __init__(self, connect_coro, loop=None):
         self.connector = connect_coro
         self._loop = loop or asyncio.get_event_loop()
 
@@ -1210,8 +1230,7 @@ class TCPQuerier(BaseQuerier):
                 await asyncio.sleep(self.query_retry_interval, loop=self._loop)
             writer = None
             try:
-                reader, writer = await self.connector(
-                    self._server, self._port, loop=self._loop)
+                reader, writer = await self.connector()
                 writer.write(to_send)
                 await writer.drain()
                 # writer.write_eof()
@@ -1234,19 +1253,19 @@ class TCPQuerier(BaseQuerier):
 class TCPPipeliningQuerier(BaseQuerier):
     """DNS querier over TCP, using pipelining.
 
-    Multiple requests are sent over the same TCP connection. Uses the
-    edns-tcp-keepalive option.
+    Implements RFC 7766 and RFC 7828.
     """
     receive_timeout = 30
     query_retries = 3
     query_retry_interval = 0
 
-    def __init__(self, server, port=53, connect_coro=asyncio.open_connection,
-                 idle_timeout=5, loop=None):
-        self._server = server
-        self._port = port
+    def __init__(self, connect_coro,
+                 idle_timeout=5, client_subnet_privacy=False,
+                 pad_to_multiple_of=None, loop=None):
         self.connector = connect_coro
         self.idle_timeout = idle_timeout
+        self._client_subnet_privacy = client_subnet_privacy
+        self._pad_to_multiple_of = pad_to_multiple_of
         self._loop = loop or asyncio.get_event_loop()
 
         self._logger = logging.getLogger('detour.dns.tcp-pl')
@@ -1269,8 +1288,7 @@ class TCPPipeliningQuerier(BaseQuerier):
             return
         self._connect_event.clear()
         try:
-            self._reader, self._writer = await self.connector(
-                self._server, self._port, loop=self._loop)
+            self._reader, self._writer = await self.connector()
         except (OSError, EOFError) as e:
             self._logger.warning('TCP connection failed: %r',
                                  ExceptionCausePrinter(e))
@@ -1316,7 +1334,7 @@ class TCPPipeliningQuerier(BaseQuerier):
                     self._logger.debug('Received DNS message:\n%s', response)
                     if response.edns == 0:
                         for option in response.options:
-                            if option.otype == 11:
+                            if option.otype == dns.edns.KEEPALIVE:
                                 # TIMEOUT is in units of 100 milliseconds
                                 this_conn_idle_timeout = int.from_bytes(
                                     option.data, 'big') / 10
@@ -1391,8 +1409,18 @@ class TCPPipeliningQuerier(BaseQuerier):
         if request is None:
             request = self._make_query(qname, ip_version)
         # RFC 7828: edns-tcp-keepalive
-        edns_tcp_keepalive = dns.edns.GenericOption(11, b'')
+        edns_tcp_keepalive = dns.edns.GenericOption(dns.edns.KEEPALIVE, b'')
         request.use_edns(0, options=[edns_tcp_keepalive])
+        # The two following options are SHOULD in RFC 8310
+        # RFC 7871: privacy election for client subnet
+        if self._client_subnet_privacy:
+            request.options.append(dns.edns.ECSOption('0.0.0.0', 0))
+        # RFC 8467: block-length padding strategy
+        if self._pad_to_multiple_of:
+            min_padded_len = len(request.to_wire()) + 4
+            pad_len = (-min_padded_len) % self._pad_to_multiple_of
+            request.options.append(dns.edns.GenericOption(
+                dns.edns.PADDING, bytes(pad_len)))
 
         last_exception = None
         for retry in range(self.query_retries):
@@ -1423,14 +1451,15 @@ class DetourProxy:
     NEXT_SOCKET_DELAY = 0.3
 
     def __init__(self, listen_host, listen_port, upstream_host, upstream_port,
-                 resolver: Resolver, detour_whitelist: DetourTokenWhitelist,
+                 resolver: Optional[Resolver],
+                 detour_whitelist: DetourTokenWhitelist,
                  *, ipv4_only=False, ipv6_only=False, ipv6_first=False,
                  loop: asyncio.AbstractEventLoop = None):
         self._listen_host = listen_host
         self._listen_port = listen_port
         self._upstream_host = upstream_host
         self._upstream_port = upstream_port
-        self._resolver = resolver
+        self.resolver = resolver
         self._whitelist = detour_whitelist
         assert not (ipv4_only and ipv6_only)
         self._ipv4_only = ipv4_only
@@ -1495,7 +1524,10 @@ class DetourProxy:
             raise
 
     async def _getaddrinfo_native(self, host, port, family=socket.AF_UNSPEC):
-        """Happy Eyeballs-appropriate getaddrinfo(). Reorders addresses."""
+        """Lookup addresses, then reorder them Happy Eyeballs-style.
+
+        Implements address sorting as specified in RFC 8305.
+        """
         addrinfos = await self._loop.getaddrinfo(
             host, port, family=family, type=socket.SOCK_STREAM)
         if family == socket.AF_UNSPEC:
@@ -1510,6 +1542,10 @@ class DetourProxy:
         return addrinfos
 
     async def _open_connections_parallel(self, addrinfo_list, delay=None):
+        """Connect to an upstream address Happy Eyeballs-style.
+
+        Implements connection attempts as specified in RFC 8305.
+        """
         if delay is None:
             delay = self.NEXT_SOCKET_DELAY
         self._logger.debug('Attempting to connect to one of: %r', addrinfo_list)
@@ -1576,7 +1612,7 @@ class DetourProxy:
         if need_token:
             assert host_entry is not None
             token = host_entry.get_dns_token()
-        addrinfo_list = await self._resolver.getaddrinfo(uhost, uport)
+        addrinfo_list = await self.resolver.getaddrinfo(uhost, uport)
         if not addrinfo_list:
             raise ConnectionError(
                 errno.EHOSTUNREACH, 'DNS resolution result empty')
@@ -2177,29 +2213,15 @@ def relay():
         '--bind-port', '-p', type=int, default=1080,
         help='''Port number to bind to. (Default: 1080)''')
     parser.add_argument(
-        '--dns', '-D', help='''IP address of a safe DNS server which returns 
-        non-poisoned results. If none of the --dns[-*] arguments are 
-        specified, it is equivalent to specifying "--dns 1.1.1.1 --dns-tcp 
-        --dns-detour", i.e. making TCP requests to Cloudflare's public DNS 
-        server through the upstream proxy.''')
-    parser.add_argument(
-        '--dns-port', '-P', type=int,
-        help='''Port number of the safe DNS server.''')
-    tcp_group = parser.add_mutually_exclusive_group()
-    tcp_group.add_argument(
-        '--dns-tcp', '-T', action='store_true', help='''Use TCP instead of 
-        UDP to make DNS queries. Query pipelining and connection keepalive 
-        are used to minimize connection overhead. The connection can be 
-        routed through the upstream proxy if --dns-detour is set.''')
-    tcp_group.add_argument(
-        '--dns-tcp-lame', action='store_true', help='''Use TCP instead of UDP 
-        to make DNS queries. Each query opens a new connection, so there's 
-        quite a bit of overhead. Use --dns-tcp instead of this if at all 
-        possible. Can be used with --dns-detour as well.''')
+        '--dns', '-D', default='tls://1dot1dot1dot1.cloudflare-dns.com',
+        help='''Specify a safe DNS server which returns 
+        non-poisoned results in URL form: protocol://host[:port]. Protocol
+        can be one of "udp", "tcp", "tls" or "tcp-lame". If port is omitted,
+        the default port for the protocol is used (853 for "tls", 53 for
+        others). See DNS notes below.''')
     parser.add_argument(
         '--dns-detour', '-R', action='store_true', help='''Make DNS queries 
-        through the upstream proxy. Only works if --dns-tcp or --dns-tcp-lame 
-        is set.''')
+        through the upstream proxy. Not available if using UDP for DNS.''')
     parser.add_argument(
         '--state', '-s', default='state.csv', help='''Path to the "state 
         file" which stores information learned about censored sites. 
@@ -2233,23 +2255,24 @@ def relay():
     args = parser.parse_args()
 
     # Argument sanity checking and defaults
-    if args.dns is None:
-        if (args.dns_port is not None or args.dns_tcp or args.dns_tcp_lame
-                or args.dns_detour):
-            sys.exit('Arguments error: --dns is not set. To use built-in '
-                     'settings, do not set ANY of the --dns[-*] options.')
-        # Use a domain name here for the DNS server, so the upstream proxy is
-        # free to decide whether to use IPv4 or IPv6.
-        args.dns = '1dot1dot1dot1.cloudflare-dns.com'
-        args.dns_tcp = True
-        args.dns_detour = True
+    dns_url_parse = urllib.parse.urlparse(args.dns, allow_fragments=False)
+    dns_default_ports_by_protocol = {
+        'udp': 53,
+        'tcp': 53,
+        'tcp-lame': 53,
+        'tls': 853,
+    }
+    dns_protocol = dns_url_parse.scheme
+    if dns_protocol not in dns_default_ports_by_protocol:
+        sys.exit('Arguments error: Invalid DNS protocol')
+    dns_host = dns_url_parse.hostname
+    dns_port = dns_url_parse.port
+    if dns_port is None:
+        dns_port = dns_default_ports_by_protocol[dns_protocol]
 
-    if args.dns_port is None:
-        args.dns_port = 53
-
-    if args.dns_detour and not (args.dns_tcp or args.dns_tcp_lame):
-        sys.exit('Arguments error: --dns-detour must be specified with '
-                 'either --dns-tcp or --dns-tcp-lame.')
+    if args.dns_detour and dns_protocol == 'udp':
+        sys.exit('Arguments error: --dns-detour is not available for '
+                 'DNS over UDP')
 
     rootlogger = logging.getLogger()
     if not args.verbose:
@@ -2276,7 +2299,7 @@ def relay():
 
     if (WINDOWS_USE_PROACTOR_EVENT_LOOP
             and WINDOWS
-            and (args.dns_tcp or args.dns_tcp_lame)):
+            and dns_protocol != 'udp'):
         policy = asyncio.get_event_loop_policy()
         if isinstance(policy, asyncio.WindowsSelectorEventLoopPolicy):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy)
@@ -2301,24 +2324,44 @@ def relay():
     else:
         logging.info('state file loaded')
 
-    assert args.dns
-    if args.dns_tcp:
-        querier_class = TCPPipeliningQuerier
-    elif args.dns_tcp_lame:
-        querier_class = TCPQuerier
+    proxy = DetourProxy(
+        args.bind, args.bind_port, args.proxy, args.proxy_port, None,
+        whitelist, ipv4_only=args.ipv4_only, ipv6_only=args.ipv6_only,
+        ipv6_first=args.ipv6_first, loop=loop)
+
+    if dns_protocol == 'udp':
+        querier = UDPQuerier(dns_host, dns_port, loop=loop)
     else:
-        querier_class = UDPQuerier
-    querier = querier_class(args.dns, args.dns_port, loop=loop)
+        if dns_protocol == 'tls':
+            context = ssl.create_default_context()
+            if not args.dns_detour:
+                connect_coro = partial(
+                    asyncio.open_connection, dns_host, dns_port, ssl=context)
+            else:
+                async def connect_coro():
+                    reader, writer = await proxy.open_connection_detour(
+                        dns_host, dns_port)
+                    await stream_start_tls(reader, writer, context, dns_host)
+                    return reader, writer
+        else:  # dns_protocol in ('tcp', 'tcp-lame')
+            if not args.dns_detour:
+                connect_coro = partial(
+                    asyncio.open_connection, dns_host, dns_port)
+            else:
+                connect_coro = partial(
+                    proxy.open_connection_detour, dns_host, dns_port)
+        if dns_protocol == 'tcp-lame':
+            querier = TCPQuerier(connect_coro, loop=loop)
+        elif dns_protocol == 'tcp':
+            querier = TCPPipeliningQuerier(connect_coro, loop=loop)
+        else:  # dns_protocol == 'tcp'
+            querier = TCPPipeliningQuerier(
+                connect_coro, client_subnet_privacy=True,
+                pad_to_multiple_of=128, loop=loop)
     resolver = Resolver(
         querier, ipv4_only=args.ipv4_only, ipv6_only=args.ipv6_only,
         ipv6_first=args.ipv6_first, loop=loop)
-
-    proxy = DetourProxy(
-        args.bind, args.bind_port, args.proxy, args.proxy_port, resolver,
-        whitelist, ipv4_only=args.ipv4_only, ipv6_only=args.ipv6_only,
-        ipv6_first=args.ipv6_first, loop=loop)
-    if args.dns_detour:
-        querier.connector = proxy.open_connection_detour
+    proxy.resolver = resolver
 
     dns_poison_path = args.poison_ip or DEFAULT_DNS_POISON_FILE
     try:
@@ -2343,6 +2386,8 @@ def relay():
         loop.run_until_complete(proxy.stop())
     finally:
         whitelist.dump_state_file(args.state)
+        if sys.version_info >= (3, 6):
+            loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
 

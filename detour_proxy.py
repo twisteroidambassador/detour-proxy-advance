@@ -2199,7 +2199,13 @@ def sigterm_handler():
 def relay():
     parser = argparse.ArgumentParser(
         description='''Automatically divert connections to censored sites 
-        through a proxy.''')
+        through a proxy.''',
+        epilog='''DNS notes: The "tcp-lame" protocol means each request creates
+        a new TCP connection, which is inefficient, so use it only as a last
+        resort. "tcp" and "tls" both uses query pipelining to achieve lower
+        overhead and better performance. These 3 protocols can be combined
+        with --dns-detour to query through the upstream proxy. However, "tls"
+        can only be combined with --dns-detour on Python 3.7+.''')
     parser.add_argument(
         'proxy',
         help='''Host name / IP address of the upstream proxy server.''')
@@ -2218,7 +2224,8 @@ def relay():
         non-poisoned results in URL form: protocol://host[:port]. Protocol
         can be one of "udp", "tcp", "tls" or "tcp-lame". If port is omitted,
         the default port for the protocol is used (853 for "tls", 53 for
-        others). See DNS notes below.''')
+        others). If unspecified, Cloudflare's public DNS over TLS is used.
+        See DNS notes below.''')
     parser.add_argument(
         '--dns-detour', '-R', action='store_true', help='''Make DNS queries 
         through the upstream proxy. Not available if using UDP for DNS.''')

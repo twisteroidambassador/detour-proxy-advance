@@ -2302,7 +2302,7 @@ def relay():
             and dns_protocol != 'udp'):
         policy = asyncio.get_event_loop_policy()
         if isinstance(policy, asyncio.WindowsSelectorEventLoopPolicy):
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy)
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     loop = asyncio.get_event_loop()
     # loop.set_debug(True)
 

@@ -1028,9 +1028,17 @@ class BaseQuerier:
 
     def _parse_response(self, response: dns.message.Message):
         """Parse the response and return (addresses, ttl)."""
+        rcode = response.rcode()
+        if rcode not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
+            raise socket.gaierror(socket.EAI_FAIL, 'DNS response has RCODE {}'.format(
+                dns.rcode.to_text(rcode)))
         min_ttl = float('inf')
-        qname = response.question[0].name
-        if response.rcode() == dns.rcode.NOERROR:
+        try:
+            qname = response.question[0].name
+        except IndexError:
+            self._logger.error('DNS response does not have any question\n%s', response)
+            raise socket.gaierror(socket.EAI_FAIL, 'DNS response has no question')
+        if rcode == dns.rcode.NOERROR:
             # Follow CNAME chain, collect addresses and ttl
             current_name = qname
             rdtype = response.question[0].rdtype
@@ -1060,9 +1068,6 @@ class BaseQuerier:
                     addresses = [rr.address for rr in rrset]
                     assert min_ttl != float('inf')
                     return addresses, min_ttl
-        elif response.rcode() != dns.rcode.NXDOMAIN:
-            raise socket.gaierror(socket.EAI_FAIL, 'DNS response has RCODE {}'.format(
-                dns.rcode.to_text(response.rcode())))
         # either NXDOMAIN or NODATA: check SOA record for ttl
         current_name = qname
         while True:

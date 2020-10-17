@@ -51,11 +51,11 @@ import dns.rdatatype
 DEFAULT_DNS_POISON_FILE = os.path.join(
     os.path.dirname(__file__), 'dns_poison_list.txt')
 
-# If the current event loop policy is WindowsSelectorEventLoopPolicy, and we're
-# not using UDP for DNS, switch to WindowsProactorEventLoopPolicy.
-# ProactorEventLoop is supposed to have
-# better performance, but it seems to be more buggy as well.
-WINDOWS_USE_PROACTOR_EVENT_LOOP = True
+# On Windows, the default event loop is ProactorEventLoop starting from
+# Python 8, and SelectorEventLoop before that. If you want to explicitly
+# choose the event loop being used, set one of the options below.
+WINDOWS_FORCE_PROACTOR_EVENT_LOOP = False
+WINDOWS_FORCE_SELECTOR_EVENT_LOOP = False
 
 # When negotiating SOCKS5 with the downstream client, return a fake IPv4
 # address / port instead of the actual bound address / port. This may help
@@ -84,40 +84,10 @@ HostType = Union[str, ipaddress.IPv4Address, ipaddress.IPv6Address]
 WINDOWS = sys.platform == 'win32'
 
 
-def monkey_patch_write_eof():
-    """Work around https://bugs.python.org/issue31647
-
-    The proper fix should be in place for Python 3.7.0 and 3.6.6.
-    """
-    if sys.version_info < (3, 6, 6):
-        import asyncio.selector_events
-        SST = asyncio.selector_events._SelectorSocketTransport
-        original_write_eof = SST.write_eof
-
-        def write_eof(self):
-            if self._closing:
-                return
-            original_write_eof(self)
-
-        SST.write_eof = write_eof
-
-
-monkey_patch_write_eof()
-
-
 def roundrobin(*iterables, _sentinel=object()):
     """roundrobin('ABC', 'D', 'EF') --> A D E B F C"""
     return (e for e in itertools.chain.from_iterable(itertools.zip_longest(
         *iterables, fillvalue=_sentinel)) if e is not _sentinel)
-
-
-# See implementation of current_task() in async-timeout; this does not
-# include a tokio-specific hack
-if sys.version_info >= (3, 7):
-    # Python 3.7 deprecates asyncio.Task.current_task()
-    current_task = asyncio.current_task
-else:
-    current_task = asyncio.Task.current_task
 
 
 # The following adapted from async-timeout by Andrew Svetlov, licensed Apache2
@@ -158,7 +128,7 @@ class Timeout:
         if self._timeout is None:
             return self
 
-        self._task = current_task()
+        self._task = asyncio.current_task()
         if self._task is None:
             raise RuntimeError('Timeout context manager should be used '
                                'inside a task')
@@ -2118,7 +2088,7 @@ DetourProxy as a SOCKS5 proxy instead.
 
         try:  # catch, log and suppress all exceptions in outermost layer
             with ExitStack() as stack:
-                this_task = current_task()
+                this_task = asyncio.current_task()
                 self._connections.add(this_task)
                 stack.callback(self._connections.remove, this_task)
                 stack.enter_context(finally_close(dwriter))
@@ -2307,12 +2277,11 @@ def relay():
     logging.captureWarnings(True)
     warnings.filterwarnings('always')
 
-    if (WINDOWS_USE_PROACTOR_EVENT_LOOP
-            and WINDOWS
-            and dns_protocol != 'udp'):
-        policy = asyncio.get_event_loop_policy()
-        if isinstance(policy, asyncio.WindowsSelectorEventLoopPolicy):
+    if WINDOWS:
+        if WINDOWS_FORCE_PROACTOR_EVENT_LOOP:
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        if WINDOWS_FORCE_SELECTOR_EVENT_LOOP:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.get_event_loop()
     # loop.set_debug(True)
 
@@ -2396,8 +2365,7 @@ def relay():
         loop.run_until_complete(proxy.stop())
     finally:
         whitelist.dump_state_file(args.state)
-        if sys.version_info >= (3, 6):
-            loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
 

@@ -51,8 +51,8 @@ import dns.rdatatype
 DEFAULT_DNS_POISON_FILE = os.path.join(
     os.path.dirname(__file__), 'dns_poison_list.txt')
 
-# On Windows, the default event loop is ProactorEventLoop starting from
-# Python 8, and SelectorEventLoop before that. If you want to explicitly
+# On Windows, the default event loop is ProactorEventLoop for
+# Python >= 3.8, and SelectorEventLoop before that. If you want to explicitly
 # choose the event loop being used, set one of the options below.
 WINDOWS_FORCE_PROACTOR_EVENT_LOOP = False
 WINDOWS_FORCE_SELECTOR_EVENT_LOOP = False

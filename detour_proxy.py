@@ -2169,7 +2169,13 @@ def sigterm_handler():
     sys.exit(0)
 
 
-def relay():
+def main():
+    if WINDOWS:
+        if WINDOWS_FORCE_PROACTOR_EVENT_LOOP:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        if WINDOWS_FORCE_SELECTOR_EVENT_LOOP:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     parser = argparse.ArgumentParser(
         description='''Automatically divert connections to censored sites 
         through a proxy.''',
@@ -2234,6 +2240,13 @@ def relay():
 
     args = parser.parse_args()
 
+    try:
+        asyncio.run(relay(args))
+    except (SystemExit, KeyboardInterrupt) as e:
+        logging.warning('Received %r', e)
+
+
+async def relay(args):
     # Argument sanity checking and defaults
     dns_url_parse = urllib.parse.urlparse(args.dns, allow_fragments=False)
     dns_default_ports_by_protocol = {
@@ -2277,13 +2290,7 @@ def relay():
     logging.captureWarnings(True)
     warnings.filterwarnings('always')
 
-    if WINDOWS:
-        if WINDOWS_FORCE_PROACTOR_EVENT_LOOP:
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        if WINDOWS_FORCE_SELECTOR_EVENT_LOOP:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.get_event_loop()
-    # loop.set_debug(True)
 
     whitelist = DetourTokenWhitelist()
     persistent_path = args.persistent or 'persistent.txt'
@@ -2353,21 +2360,17 @@ def relay():
     else:
         logging.info('DNS poison IP list loaded')
 
-    windows_async_signal_helper(loop)
     with suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
 
-    loop.run_until_complete(proxy.start())
+    await proxy.start()
     try:
-        loop.run_forever()
-    except (SystemExit, KeyboardInterrupt) as e:
-        logging.warning('Received %r', e)
-        loop.run_until_complete(proxy.stop())
+        while True:
+            await asyncio.sleep(1)
     finally:
+        await proxy.stop()
         whitelist.dump_state_file(args.state)
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
 
 
 if __name__ == '__main__':
-    relay()
+    main()

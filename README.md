@@ -40,7 +40,7 @@ The end result is that, censored websites either work right away, or starts work
 
 The following are required to use Detour Proxy Advance:
 
-- Python 3.5 or higher. **Using the latest Python 3 release is STRONGLY RECOMMENDED**, since this project gets very little testing on  older Python versions.
+- Python 3.7 or higher. **Using the latest Python 3 release is STRONGLY RECOMMENDED**, since this project gets very little testing on  older Python versions.
 - The `dnspython` Python package.
 - A SOCKS5 proxy server that can reach censored websites. This can be anything that presents a SOCKS5 server with no user authentication: a plain proxy server, a proxy server tunneled through a VPN, `stunnel` or `obfs4proxy`, a SSH connection with dynamic forwarding, etc. (Proxies with user authentication are not supported.)
 - Optional: A DNS server that returns authentic, non-poisoned IP addresses. This can be a local DNS proxy utilizing one of the encrypted protocols (DNSCrypt, DNS over TLS, DNS over HTTPS, etc.), a DNS server across a VPN link, a DNS server that supports TLS, etc. Detour Proxy Advance can also use the upstream SOCKS5 proxy to reach a public DNS service.

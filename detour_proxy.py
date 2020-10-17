@@ -158,7 +158,7 @@ class Timeout:
         if self._timeout is None:
             return self
 
-        self._task = current_task(loop=self._loop)
+        self._task = current_task()
         if self._task is None:
             raise RuntimeError('Timeout context manager should be used '
                                'inside a task')
@@ -918,8 +918,8 @@ class Resolver:
         self._loop = loop or asyncio.get_event_loop()
 
         self._logger = logging.getLogger('detour.dns.resolver')
-        self._cache_ipv4 = ResolverCache(max_ttl=max_ttl, loop=self._loop)
-        self._cache_ipv6 = ResolverCache(max_ttl=max_ttl, loop=self._loop)
+        self._cache_ipv4 = ResolverCache(max_ttl=max_ttl)
+        self._cache_ipv6 = ResolverCache(max_ttl=max_ttl)
 
     async def _query_and_cache(self, key, ip_version=4):
         if ip_version == 4:
@@ -957,7 +957,7 @@ class Resolver:
             ipv4_task = self._loop.create_task(self._query_and_cache(key, 4))
             ipv6_task = self._loop.create_task(self._query_and_cache(key, 6))
             ipv4_result, ipv6_result = await asyncio.gather(
-                ipv4_task, ipv6_task, loop=self._loop)
+                ipv4_task, ipv6_task)
             exception_count = 0
             e = ipv4_task.exception()
             if e:
@@ -1152,8 +1152,7 @@ class UDPQuerier(BaseQuerier):
 
         self._logger = logging.getLogger('detour.dns.udp')
         self._fallback_querier = TCPQuerier(
-            partial(asyncio.open_connection, self._server, self._port),
-            loop=self._loop)
+            partial(asyncio.open_connection, self._server, self._port))
 
     async def query(self, qname=None, ip_version=4,
                     request: dns.message.Message = None):
@@ -1161,7 +1160,7 @@ class UDPQuerier(BaseQuerier):
             request = self._make_query(qname, ip_version)
         request.use_edns(0)
 
-        response_fut = asyncio.Future(loop=self._loop)
+        response_fut = asyncio.Future()
         transport, protocol = await self._loop.create_datagram_endpoint(
             partial(DNSUDPReceiverProtocol, request, response_fut),
             remote_addr=(self._server, self._port))
@@ -1172,7 +1171,7 @@ class UDPQuerier(BaseQuerier):
                 self._logger.debug('Sending request for %s', qname)
                 transport.sendto(request_wire)
                 done, pending = await asyncio.wait(
-                    (response_fut,), loop=self._loop, timeout=timeout)
+                    (response_fut,), timeout=timeout)
                 if done:
                     response = response_fut.result()
                     self._logger.debug('Response for %s received', qname)
@@ -1232,7 +1231,7 @@ class TCPQuerier(BaseQuerier):
         to_send = len(request_wire).to_bytes(2, 'big') + request_wire
         for retry in range(self.query_retries):
             if retry:
-                await asyncio.sleep(self.query_retry_interval, loop=self._loop)
+                await asyncio.sleep(self.query_retry_interval)
             writer = None
             try:
                 reader, writer = await self.connector()
@@ -1276,7 +1275,7 @@ class TCPPipeliningQuerier(BaseQuerier):
         self._logger = logging.getLogger('detour.dns.tcp-pl')
         self._reader = None  # type: asyncio.StreamReader
         self._writer = None  # type: asyncio.StreamWriter
-        self._connect_event = asyncio.Event(loop=self._loop)
+        self._connect_event = asyncio.Event()
         self._connect_event.set()
         self._receive_task = None
         self._idle_timeout_ctx = None  # type: Timeout
@@ -1321,8 +1320,8 @@ class TCPPipeliningQuerier(BaseQuerier):
                     idle_timeout = None
                 else:
                     idle_timeout = this_conn_idle_timeout
-                async with Timeout(self.receive_timeout, loop=self._loop), \
-                           Timeout(idle_timeout, loop=self._loop) \
+                async with Timeout(self.receive_timeout), \
+                           Timeout(idle_timeout) \
                         as self._idle_timeout_ctx:
                     try:
                         response_len = int.from_bytes(
@@ -1430,7 +1429,7 @@ class TCPPipeliningQuerier(BaseQuerier):
         last_exception = None
         for retry in range(self.query_retries):
             if retry:
-                await asyncio.sleep(self.query_retry_interval, loop=self._loop)
+                await asyncio.sleep(self.query_retry_interval)
             try:
                 response = await self._send_query(request)
                 break
@@ -1485,8 +1484,7 @@ class DetourProxy:
 
     async def start(self):
         self._server = await asyncio.start_server(
-            self._server_handler, self._listen_host, self._listen_port,
-            loop=self._loop)
+            self._server_handler, self._listen_host, self._listen_port)
         self._logger.info('DetourProxy listening on %r',
                           [s.getsockname() for s in self._server.sockets])
 
@@ -1501,7 +1499,7 @@ class DetourProxy:
         if self._connections:
             for conn in self._connections:
                 conn.cancel()
-            done, _ = await asyncio.wait(self._connections, loop=self._loop)
+            done, _ = await asyncio.wait(self._connections)
             for d in done:
                 if not d.cancelled() and d.exception():
                     self._logger.error('Exception in closed connection',
@@ -1556,11 +1554,11 @@ class DetourProxy:
         self._logger.debug('Attempting to connect to one of: %r', addrinfo_list)
         coro_fns = [partial(self._connect_sock, a) for a in addrinfo_list]
         connected_sock, _, exceptions = await staggered_race(
-            coro_fns, delay, loop=self._loop)
+            coro_fns, delay)
         if connected_sock:
             try:
                 return await asyncio.open_connection(
-                    loop=self._loop, limit=self.RELAY_BUFFER_SIZE,
+                    limit=self.RELAY_BUFFER_SIZE,
                     sock=connected_sock)
             except:
                 connected_sock.close()
@@ -1730,7 +1728,7 @@ class DetourProxy:
             token = host_entry.get_detour_token()
         try:
             r, w, bindaddr = await self._open_connection_detour(
-                uhost, uport, loop=self._loop, limit=self.RELAY_BUFFER_SIZE)
+                uhost, uport, limit=self.RELAY_BUFFER_SIZE)
         except OSError as e:
             self._logger.warning('Connecting to upstream proxy failed: %r',
                                  ExceptionCausePrinter(e))
@@ -1759,7 +1757,7 @@ class DetourProxy:
         coro_fns = [partial(self._make_connection, conn, host_entry, host, port,
                             log_name) for conn in connections]
         success_result, success_idx, exceptions = await staggered_race(
-            coro_fns, self.NEXT_METHOD_DELAY, loop=self._loop)
+            coro_fns, self.NEXT_METHOD_DELAY)
         fail_reasons = {conn[0]: exc for conn, exc
                         in zip(connections, exceptions) if exc is not None}
         success_connection = None
@@ -2095,7 +2093,7 @@ DetourProxy as a SOCKS5 proxy instead.
             ureader, dwriter, '{!r} <-- {!r}'.format(dname, uname), False))
         try:
             u_bytes_relayed, d_bytes_relayed = await asyncio.gather(
-                utask, dtask, loop=self._loop)
+                utask, dtask)
             if u_bytes_relayed and not d_bytes_relayed:
                 raise UpstreamRelayError('Upstream server did not send data')
         except:
@@ -2339,10 +2337,10 @@ def relay():
     proxy = DetourProxy(
         args.bind, args.bind_port, args.proxy, args.proxy_port, None,
         whitelist, ipv4_only=args.ipv4_only, ipv6_only=args.ipv6_only,
-        ipv6_first=args.ipv6_first, loop=loop)
+        ipv6_first=args.ipv6_first)
 
     if dns_protocol == 'udp':
-        querier = UDPQuerier(dns_host, dns_port, loop=loop)
+        querier = UDPQuerier(dns_host, dns_port)
     else:
         if dns_protocol == 'tls':
             context = ssl.create_default_context()
@@ -2363,16 +2361,16 @@ def relay():
                 connect_coro = partial(
                     proxy.open_connection_detour, dns_host, dns_port)
         if dns_protocol == 'tcp-lame':
-            querier = TCPQuerier(connect_coro, loop=loop)
+            querier = TCPQuerier(connect_coro)
         elif dns_protocol == 'tcp':
-            querier = TCPPipeliningQuerier(connect_coro, loop=loop)
+            querier = TCPPipeliningQuerier(connect_coro)
         else:  # dns_protocol == 'tcp'
             querier = TCPPipeliningQuerier(
                 connect_coro, client_subnet_privacy=True,
-                pad_to_multiple_of=128, loop=loop)
+                pad_to_multiple_of=128)
     resolver = Resolver(
         querier, ipv4_only=args.ipv4_only, ipv6_only=args.ipv6_only,
-        ipv6_first=args.ipv6_first, loop=loop)
+        ipv6_first=args.ipv6_first)
     proxy.resolver = resolver
 
     dns_poison_path = args.poison_ip or DEFAULT_DNS_POISON_FILE

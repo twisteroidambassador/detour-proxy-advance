@@ -1383,18 +1383,20 @@ class TCPPipeliningQuerier(BaseQuerier):
         if request is None:
             request = self._make_query(qname, ip_version)
         # RFC 7828: edns-tcp-keepalive
-        edns_tcp_keepalive = dns.edns.GenericOption(dns.edns.KEEPALIVE, b'')
-        request.use_edns(0, options=[edns_tcp_keepalive])
+        options = [dns.edns.GenericOption(dns.edns.KEEPALIVE, b'')]
+        request.use_edns(0, options=options)
         # The two following options are SHOULD in RFC 8310
         # RFC 7871: privacy election for client subnet
         if self._client_subnet_privacy:
-            request.options.append(dns.edns.ECSOption('0.0.0.0', 0))
+            options.append(dns.edns.ECSOption('0.0.0.0', 0))
+            request.use_edns(0, options=options)
         # RFC 8467: block-length padding strategy
         if self._pad_to_multiple_of:
             min_padded_len = len(request.to_wire()) + 4
             pad_len = (-min_padded_len) % self._pad_to_multiple_of
-            request.options.append(dns.edns.GenericOption(
+            options.append(dns.edns.GenericOption(
                 dns.edns.PADDING, bytes(pad_len)))
+            request.use_edns(0, options=options)
 
         last_exception = None
         for retry in range(self.query_retries):

@@ -1554,8 +1554,9 @@ class DetourProxy:
                 raise ConnectionError(
                     errno.EHOSTUNREACH,
                     'Cannot connect to IPv6 address when ipv4_only is set')
-            addrinfo_list = [(socket.AF_INET6, socket.SOCK_STREAM, 0, '',
-                              (uhost.compressed, uport))]
+            addrinfo_list = await self._loop.getaddrinfo(
+                uhost.compressed, uport,
+                family=socket.AF_INET6, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST)
         else:
             if self._ipv4_only:
                 family = socket.AF_INET

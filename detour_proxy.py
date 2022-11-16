@@ -868,7 +868,8 @@ class ResolverCache:
         self._logger.debug('no cached answer for %r, querying', key)
         answer_fut = asyncio.Future()
         self._cache[key] = answer_fut
-        self._loop.create_task(self._query_then_cache(answer_fut, key, query_coro, *args))
+        query_task = self._loop.create_task(self._query_then_cache(answer_fut, key, query_coro, *args))
+        await asyncio.wait((query_task,))
         return await asyncio.shield(answer_fut)
 
 
